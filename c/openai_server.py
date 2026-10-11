@@ -5000,6 +5000,19 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
+def _route_top_k(model):
+    """num_experts_per_tok of a model directory's config.json (its text_config first), 0 when unknown."""
+    try:
+        cfg = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return 0
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    try:
+        return max(0, int(text.get("num_experts_per_tok") or cfg.get("num_experts_per_tok") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def cap_for_arch(arch, cap, env=None, model=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
@@ -5060,13 +5073,22 @@ def cap_for_arch(arch, cap, env=None, model=None):
             if arch in ("deepseek_v41", "mimo"):
                 raise
             # The Qwen engines ran on their implicit cap before the plan was
-            # applied: a model the planner cannot read still starts as before.
-            print(f"[{arch}] no RAM plan ({error}); {limits.implicit_cap} expert cache "
+            # applied: a model the planner cannot read still starts as before,
+            # with at least one token's route (top-k) in the cache.
+            floor = max(limits.implicit_cap, _route_top_k(model))
+            print(f"[{arch}] no RAM plan ({error}); {floor} expert cache "
                   f"slots/layer, --cap or coli tune sets more", file=sys.stderr)
-            return limits.implicit_cap
-        if slots < 1:
+            return floor
+        # A Qwen cache below one token's route (top-k) reads that token's experts
+        # from the disk at every step: Qwen3.8's implicit cap is 1 and its route
+        # 10, and a Windows box whose free RAM made the plan come out empty
+        # decoded at 0.03 tok/s while the engine measured room for 99 (#2031).
+        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38") else 1
+        if slots < floor:
             if arch in ("qwen36", "qwen38"):
-                return limits.implicit_cap
+                print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
+                      f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
+                return floor
             raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
                              f"expert slot per layer")
         print(f"[{'v41' if arch == 'deepseek_v41' else arch}] RAM plan: {slots} expert cache "
