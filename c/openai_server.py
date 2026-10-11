@@ -6344,6 +6344,12 @@ class APIServer(ThreadingHTTPServer):
         entry = model_object(self.model_id, self.created)
         entry["input_modalities"] = self.input_modalities()
         entry["capabilities"] = self.capabilities()
+        limit = getattr(self, "context_limit", None)
+        if limit and "chat" in entry["capabilities"]:
+            # The context the engine holds, by the names agents look for (Hermes Agent,
+            # vLLM and LiteLLM clients). Without it they assume a window the engine does
+            # not have (Hermes: 128k), compact too late and end in context_length_exceeded.
+            entry["context_length"] = entry["max_model_len"] = int(limit)
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}

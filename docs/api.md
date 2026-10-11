@@ -574,11 +574,14 @@ stream chunk (empty `choices`) before the first token, and the header
 `context_length_exceeded`.
 
 The context itself: a server whose context variable nobody set (`--ctx`, or the
-family's `CTX`, `Q36_MAXT`, ...) picks the largest of 16384, 32768 and 65536
-tokens whose conversation state, for every KV slot, takes at most a tenth of
-the memory (`RAM_GB` when set, the available memory otherwise), and the
-family's own default when even 16384 does not fit that. The startup log says
-which (`[gateway] 32768 tokens of context ...`).
+family's `CTX`, `Q36_MAXT`, ...) picks the largest of 16384, 32768, 65536, 131072
+and 262144 tokens (up to the family's maximum) whose conversation state, for every
+KV slot, takes at most a quarter of the memory up to 65536 tokens and a tenth
+beyond (`RAM_GB` when set, the available memory otherwise), and the family's own
+default when even 16384 does not fit that. The larger share up to 64k is for
+coding agents, which do not run on less. The startup log says which
+(`[gateway] 65536 tokens of context ...`), and `GET /v1/models` reports it as
+`context_length` (and `max_model_len`), where agents read it.
 
 ## Isolated KV contexts
 
