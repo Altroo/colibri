@@ -3913,10 +3913,15 @@ static int xb_gemm_slot(const XbCtx *X, int S) {
 }
 
 /* The grouped GEMM's pipelines (qmatmul_grp*.spv beside the main shader); leaves
- * X->grp_rows at 0 when the device or the files do not allow it. */
+ * X->grp_rows at 0 when the device or the files do not allow it. qmatmul_grp_gate_up's
+ * shared arrays have a fixed size, held to the compiled shader's by
+ * tests/test_vk_shared_memory.py: a device with less keeps the per-expert route (#1998). */
+#define GRP_GATE_UP_SHARED 36864u
 static void xb_grp_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GROUPED");
     if (X->d || !G.has_bda || !G.has_coop || G.coop_sg != 64 || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    if (lp.limits.maxComputeSharedMemorySize < GRP_GATE_UP_SHARED) return;
     const char *nm[2] = {"qmatmul_grp.spv", "qmatmul_grp_gate_up.spv"};
     for (int v = 0; v < 2; v++) {
         char path[1100];
