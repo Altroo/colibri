@@ -2944,8 +2944,13 @@ def _family_expert_cache_knob(family_id, cache_bytes):
 # `coli chat` outgrew it in a few long answers (and was then compacted, or before that
 # refused). The step chosen is the largest whose conversation state, for every KV slot,
 # takes at most this share of the memory there is: the expert cache keeps the rest.
-CHAT_CONTEXT_STEPS = (16384, 32768, 65536)
+# Up to CHAT_CONTEXT_AGENT the share is larger: coding agents do not run below 64k
+# (Hermes Agent refuses a smaller window, OpenClaw's system prompt alone is about 17k
+# tokens), so a server that could hold 64k and gave 32k left them nothing to work with.
+CHAT_CONTEXT_STEPS = (16384, 32768, 65536, 131072, 262144)
 CHAT_CONTEXT_SHARE = 0.10
+CHAT_CONTEXT_AGENT = 65536
+CHAT_CONTEXT_AGENT_SHARE = 0.25
 
 
 def chat_context(model, env=None, kv_slots=1, available=None):
@@ -2983,7 +2988,8 @@ def chat_context(model, env=None, kv_slots=1, available=None):
             state = planner_geometry(resolved, step).context_state_bytes
         except ValueError:
             break
-        if state * kv_slots > CHAT_CONTEXT_SHARE * budget:
+        share = CHAT_CONTEXT_AGENT_SHARE if step <= CHAT_CONTEXT_AGENT else CHAT_CONTEXT_SHARE
+        if state * kv_slots > share * budget:
             break
         chosen = step
     if chosen == base:

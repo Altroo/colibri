@@ -2868,6 +2868,19 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
+    def test_models_report_the_context(self):
+        """Agents size their own compaction from the listed context (#1973's limit)."""
+        def entry():
+            with self.request("/v1/models") as response:
+                return json.load(response)["data"][0]
+        self.assertNotIn("context_length", entry())
+        self.server.context_limit = 65536
+        self.addCleanup(setattr, self.server, "context_limit", None)
+        listed = entry()
+        self.assertEqual((listed["context_length"], listed["max_model_len"]), (65536, 65536))
+        with self.request("/v1/models/test-model") as response:
+            self.assertEqual(json.load(response)["context_length"], 65536)
+
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (
             ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},
