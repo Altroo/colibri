@@ -2683,7 +2683,15 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (tw->nbytes == want_w / 2) {
         static int noted = 0;
         if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? "kept int4, repacked planar for expert_ffn.h" : "unpacking to int8 in slot"); noted = 1; }
-        uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
+        /* The packed bytes pass through a block the thread keeps (one per thread
+         * that loads experts, 1.5 MB on the 35B, never given back). Allocated and
+         * freed for every miss, a block this size is mapped, zeroed and unmapped
+         * each time on Windows: measured there, a copy and a repack of 1.5 MB take
+         * 0.67 ms with the malloc and the free and 0.09 ms without. */
+        static _Thread_local uint8_t *raw; static _Thread_local size_t raw_cap;
+        if (raw_cap < (size_t)(want_w / 2)) {
+            free(raw); raw = (uint8_t *)malloc((size_t)(want_w / 2)); raw_cap = raw ? (size_t)(want_w / 2) : 0;
+        }
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
         if (s->pw) {
@@ -2693,7 +2701,6 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->hidden);
             xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->hidden, cc->inter);
             s->is_int4 = 1;
-            free(raw);
             st_read_f32(&m->S, qsnm, s->gs, 0);
             return;
         }
@@ -2718,7 +2725,6 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             memcpy(s->u4, raw + gp,      (size_t)up);
             memcpy(s->d4, raw + gp + up, (size_t)dp);
         }
-        free(raw);
     } else {
         s->is_int4 = 0;
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
