@@ -545,6 +545,70 @@ key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 > API and mostly won't be worth the wait. If your client lets you trim or disable
 > its system preamble and tool catalog, do it.
 
+### Agents: Hermes Agent, OpenClaw, Cline
+
+These agents need room: Hermes Agent refuses a window below 64,000 tokens, and
+their first request alone is 5-14k tokens (a system prompt plus a few dozen tool
+schemas). A server whose context nobody set gives a chat model 65536 tokens
+whenever that fits in a quarter of the memory (more where a tenth allows it, see
+[below](#conversations-longer-than-the-context)), and `GET /v1/models` reports
+it as `context_length` and `max_model_len`. Hermes Agent reads it from there; for
+the others, put the same number in their configuration (`coli serve` prints it:
+`[gateway] 65536 tokens of context ...`). An agent that believes in a larger
+window than the server holds compacts too late and ends in
+`context_length_exceeded`.
+
+Measured on 2026-10-11 against Qwen3.6-35B-A3B (int4) on a Ryzen 7 PRO 8700GE,
+each agent asked to count the files in a directory with a tool:
+
+| Agent | First request | Tools sent | Result |
+|---|---|---|---|
+| Hermes Agent 0.19.0 | 13,753 tokens | 27 | `terminal` called, the right count |
+| OpenClaw 2026.10.1 | 10,855 tokens | 11 | `ls` called, the right count and the names |
+| Cline CLI 3.0.70 | 5,566 tokens | 25 | `run_commands` called, the right count, 2 minutes in all |
+
+The first request is the slow one: about 35 tokens a second of prefill on that
+machine, six and a half minutes for Hermes' 13,753 tokens, with a keepalive on
+the stream every 10 seconds so the client does not give up. The next turns
+reuse the prefix and prefill only what is new.
+
+**Hermes Agent** (`~/.hermes/config.yaml`):
+
+```yaml
+model:
+  default: qwen3.6            # the --model-id of coli serve
+  provider: custom
+  base_url: http://localhost:8000/v1
+  api_key: local
+```
+
+**OpenClaw** (`~/.openclaw/openclaw.json`; `contextWindow` is the server's
+`context_length`):
+
+```json
+{
+  "agents": { "defaults": { "model": { "primary": "colibri/qwen3.6" } } },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "colibri": {
+        "baseUrl": "http://localhost:8000/v1",
+        "apiKey": "sk-local",
+        "api": "openai-completions",
+        "timeoutSeconds": 3600,
+        "models": [{ "id": "qwen3.6", "name": "Qwen3.6 (colibri)", "reasoning": false,
+                     "input": ["text"], "contextWindow": 65536, "maxTokens": 8192 }]
+      }
+    }
+  }
+}
+```
+
+**Cline CLI**: `cline auth -p openai -b http://localhost:8000/v1 -k local -m qwen3.6`,
+then `cline "..."`. In the editor extension, choose the *OpenAI Compatible*
+provider with the same base URL and model, and set its context window to the
+server's `context_length`.
+
 ## Conversations longer than the context
 
 A chat request may opt into context compaction with the extension field
