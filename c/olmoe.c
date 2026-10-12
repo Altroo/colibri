@@ -101,6 +101,7 @@ typedef struct {
 /* ---------- pesi densi per-layer ---------- */
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
+    uint16_t *q_h, *k_h, *v_h, *o_h;   /* half-resident twins of q/k/v/o (COLI_DENSE_F16); the f32 pointer is NULL when set */
 #ifdef COLI_VULKAN
     void *vk_q, *vk_k, *vk_v, *vk_o, *vk_gate;   /* device copies, on first use */
 #endif
@@ -139,6 +140,7 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *lm_head, *final_norm;
+    uint16_t *lm_head_h;    /* half-resident lm_head (COLI_DENSE_F16); lm_head is NULL when set */
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
@@ -345,6 +347,7 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+#include "matmul_f16.h"   /* the same product with W kept as IEEE half: bit-identical, half the bytes (needs F16C) */
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
  * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
@@ -382,6 +385,22 @@ static void olmoe_vk_report(void) {
 #define MATMUL_RES(y, x, W, vk, S, I, O) matmul_res(y, x, W, &(vk), S, I, O)
 #else
 #define MATMUL_RES(y, x, W, vk, S, I, O) matmul(y, x, W, S, I, O)
+#endif
+
+/* Dense weights kept as half. The checkpoint stores attention and lm_head as FP16, and the engine used to widen
+ * them to f32 in RAM, doubling the bytes a cached decode step streams from DRAM for them (~0.75 GB of the
+ * ~2.3 GB a token reads on OLMoE-1B-7B). Widening half to f32 is exact and matmul_f16w() runs matmul()'s exact
+ * lanes on the widened values, so the output is bit-identical (tests/test_matmul_f16.c); only the bytes change.
+ * COLI_DENSE_F16=0 turns it off. Standalone engine only (the segment/edge adapters keep f32), and not in a
+ * Vulkan build, whose device tier wants the f32 host copy. */
+#if defined(COLI_MATMUL_F16) && !defined(COLI_VULKAN)
+#define OLM_DENSE_F16 1
+#endif
+static int g_dense_f16 = 0;
+#ifdef OLM_DENSE_F16
+#define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) do { if (Wh) matmul_f16w(y, x, Wh, S, I, O); else matmul(y, x, W, S, I, O); } while (0)
+#else
+#define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) MATMUL_RES(y, x, W, vk, S, I, O)
 #endif
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
@@ -636,6 +655,26 @@ static float *load_t(Model *m, const char *name, int64_t rows, int64_t columns) 
     return p;
 }
 
+/* A [rows, columns] matrix of the dense part: the half copy (returned NULL, *h set) when the checkpoint stores it
+ * as FP16 and COLI_DENSE_F16 is on, else the usual f32 copy with *h NULL. Shape checks are load_t's. */
+static float *load_t_dense(Model *m, const char *name, int64_t rows, int64_t columns, uint16_t **h) {
+    *h = NULL;
+#ifdef OLM_DENSE_F16
+    if (g_dense_f16) {
+        st_tensor *t = st_find(&m->S, name);
+        if (t && t->dtype == 1 && t->rank == 2 && t->shape[0] == rows && t->shape[1] == columns &&
+            t->nbytes == t->numel * 2) {
+            uint16_t *p = malloc((size_t)t->nbytes);
+            if (!p) { fprintf(stderr, "out of memory reading %s\n", name); exit(1); }
+            st_read_raw(&m->S, name, p, 0);
+            *h = p;
+            return NULL;
+        }
+    }
+#endif
+    return load_t(m, name, rows, columns);
+}
+
 /* One slot holds one expert: three int8 matrices plus their row scales, the
  * same arithmetic the Segment adapter uses to turn a memory limit into a cap. */
 static int64_t slot_bytes(const Cfg *c) {
@@ -661,7 +700,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     double t0 = now_s();
     if (load_boundaries) {
         m->embed      = load_t(m, "model.embed_tokens.weight", c->vocab, c->hidden);
-        m->lm_head    = load_t(m, "lm_head.weight", c->vocab, c->hidden);
+        m->lm_head    = load_t_dense(m, "lm_head.weight", c->vocab, c->hidden, &m->lm_head_h);
         m->final_norm = load_t(m, "model.norm.weight", c->hidden, 0);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
@@ -673,8 +712,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,rows,columns)
         LD(in_ln,  "input_layernorm.weight", D, 0);
         LD(post_ln,"post_attention_layernorm.weight", D, 0);
-        LD(q, "self_attn.q_proj.weight", D, D); LD(k, "self_attn.k_proj.weight", D, D);
-        LD(v, "self_attn.v_proj.weight", D, D); LD(o, "self_attn.o_proj.weight", D, D);
+        #define LDD(field, hfield, suffix) \
+            snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t_dense(m,nm,D,D,&l->hfield)
+        LDD(q, q_h, "self_attn.q_proj.weight"); LDD(k, k_h, "self_attn.k_proj.weight");
+        LDD(v, v_h, "self_attn.v_proj.weight"); LDD(o, o_h, "self_attn.o_proj.weight");
+        #undef LDD
         LD(qn,"self_attn.q_norm.weight", D, 0); LD(kn,"self_attn.k_norm.weight", D, 0);
         LD(gate, "mlp.gate.weight", c->n_experts, D);
         #undef LD
@@ -1241,9 +1283,9 @@ static void rope_head(float *x, int pos, const Cfg *c) {
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
-    MATMUL_RES(q, x, l->q, l->vk_q, S, D, D);
-    MATMUL_RES(k, x, l->k, l->vk_k, S, D, D);
-    MATMUL_RES(vv, x, l->v, l->vk_v, S, D, D);
+    MATMUL_RESH(q, x, l->q, l->q_h, l->vk_q, S, D, D);
+    MATMUL_RESH(k, x, l->k, l->k_h, l->vk_k, S, D, D);
+    MATMUL_RESH(vv, x, l->v, l->v_h, l->vk_v, S, D, D);
     /* qk-norm sull'intero vettore hidden, poi RoPE per testa */
     for (int s = 0; s < S; s++) {
         rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
@@ -1286,7 +1328,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     (void)Tk;
-    MATMUL_RES(out, ctx, l->o, l->vk_o, S, D, D);
+    MATMUL_RESH(out, ctx, l->o, l->o_h, l->vk_o, S, D, D);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -1808,7 +1850,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            MATMUL_RES(elog, erow, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
+            MATMUL_RESH(elog, erow, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
             olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
         free(erow); free(elog);
@@ -1824,7 +1866,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double t_head = now_s();
-    MATMUL_RES(logit, last, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
+    MATMUL_RESH(logit, last, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
@@ -1872,7 +1914,7 @@ static float *olm_step_rows(Model *m, const OlmRow *rows, const int *ids, int S)
     float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
     for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
     double t_head = now_s();
-    MATMUL_RES(logit, last, m->lm_head, m->vk_lm_head, S, D, c->vocab);
+    MATMUL_RESH(logit, last, m->lm_head, m->lm_head_h, m->vk_lm_head, S, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;
     free(x); free(last);
@@ -2806,6 +2848,7 @@ int main(int argc, char **argv) {
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
+    g_dense_f16  = getenv("COLI_DENSE_F16") ? atoi(getenv("COLI_DENSE_F16")) : 1;   /* standalone engine only, see OLM_DENSE_F16 */
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
@@ -3032,6 +3075,7 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
 #endif
         free(weights->in_ln); free(weights->post_ln);
         free(weights->q); free(weights->k); free(weights->v); free(weights->o);
+        free(weights->q_h); free(weights->k_h); free(weights->v_h); free(weights->o_h);
         free(weights->qn); free(weights->kn); free(weights->gate);
         LCache *cache = &model->cache[layer];
         for (int slot = 0; slot < cache->n; slot++) {
