@@ -945,6 +945,14 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     if release_asset_suffix() is None:
         raise SetupError(f"no compiler here, and no prebuilt engine is published for "
                          f"{host_os()}/{host_machine()}: {package_hint(['build'])}")
+    # The prebuilt engines assume x86-64-v3: on an older processor they stop at their
+    # first AVX2 instruction (#1979). A compiler builds one for this processor instead.
+    # COLI_CPU_CHECK=0 trusts the archive anyway, as it does in the engines.
+    missing = setup_hw.missing_for_prebuilt(setup_hw.detect_cpu())
+    if missing and os.environ.get("COLI_CPU_CHECK") != "0":
+        raise SetupError(f"this processor has no {', '.join(f.upper() for f in missing)}, which "
+                         "the prebuilt engines need; with a compiler setup builds the engine for "
+                         f"this processor: {package_hint(['build'])}")
     out("  no compiler found: using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):
@@ -1110,14 +1118,39 @@ def run_environment(backend, engine, family, hw):
     return env
 
 
-def launcher_args(backend, model_dir, host, port):
+def applies_plan(backend, family):
+    """Whether the recorded run passes --auto-tier, which applies the plan the setup
+    prints (the expert cache, RAM_GB) and a `coli tune` profile. CUDA always did. On
+    Vulkan or the CPU a family with a fixed default cap needs it too, or it runs that
+    default whatever the plan said: Qwen3.6 at 8 slots a layer, 3.6 tok/s where the
+    plan gives 17.5 (#2003). The GLM engines and OLMoE size their cache themselves
+    (implicit cap 0) and keep doing so."""
+    return backend == "cuda" or family is None or family.limits.implicit_cap != 0
+
+
+def launcher_args(backend, model_dir, host, port, ctx=0, family=None):
+    """What `coli start` runs."""
     args = ["web", "--model", model_dir, "--host", host, "--port", str(port)]
     if backend == "cuda":
-        args += ["--gpu", "auto", "--auto-tier"]
+        args += ["--gpu", "auto"]
+    if applies_plan(backend, family):
+        args.append("--auto-tier")
+    if ctx:
+        args += ["--ctx", str(int(ctx))]
     return args
 
 
-def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status="ready"):
+def check_ctx(ctx, family):
+    """`coli setup --ctx`: a context the family can hold, checked before anything is
+    built or downloaded (#2011)."""
+    if ctx < 0:
+        raise SetupError("--ctx must be a number of tokens, or 0 for the automatic context")
+    if ctx and family.limits.max_context and ctx > family.limits.max_context:
+        raise SetupError(f"--ctx {ctx} exceeds what {family.display_name} supports "
+                         f"({family.limits.max_context} tokens)")
+
+
+def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status="ready", ctx=0):
     backend = engine_info["backend"]
     return {
         "status": status,
@@ -1133,7 +1166,7 @@ def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status
         "backend": backend,
         "gpu": engine_info.get("gpu"),
         "env": run_environment(backend, engine_info["engine"], family, hw),
-        "args": launcher_args(backend, model_dir, host, port),
+        "args": launcher_args(backend, model_dir, host, port, ctx, family),
         "host": host,
         "port": port,
         "urls": urls(host, port),
@@ -1219,9 +1252,27 @@ def _get_json(url, timeout=2.0):
 
 
 def port_free(host, port):
+    """Nothing answers on `port`, and a server could bind it now. Connecting alone took
+    a port nobody listens on for a free one even when a socket held it -- in the
+    ephemeral range, the local end of some outgoing connection -- and the server then
+    failed with "Address already in use" (test_setup_flow on a busy CI runner)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) != 0
+        if sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) == 0:
+            return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if os.name != "nt":
+                # as the server binds (socketserver's allow_reuse_address): a port in
+                # TIME_WAIT is free for it. On Windows the option would let the probe
+                # share a port that is in use, so it is left off there.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host or "0.0.0.0", port))
+    except socket.gaierror:
+        return True               # not an IPv4 address: the connect above is all there is
+    except OSError:
+        return False
+    return True
 
 
 def pick_port(host, preferred, tries=20):
@@ -1294,7 +1345,14 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     launcher = cfg["launcher"]
     if not os.path.isfile(launcher):
         raise SetupError(f"the launcher {launcher} is gone; run `coli setup` again")
-    cmd = [sys.executable, launcher] + list(cfg["args"])
+    args = list(cfg["args"])
+    try:
+        family = family_by_id(cfg.get("family"))
+    except Exception:
+        family = None
+    if "--auto-tier" not in args and applies_plan(cfg.get("backend"), family):
+        args.append("--auto-tier")   # a setup from before #2003: its plan applies too
+    cmd = [sys.executable, launcher] + args
     if not open_browser and "--no-browser" not in cmd:
         cmd.append("--no-browser")
     env = dict(cfg.get("env") or {})
@@ -1657,11 +1715,11 @@ def run_post_install(entry, launcher_dir, model_dir, ui):
             raise SetupError(f"tools/{tool}.py failed: {(result.stderr or result.stdout).strip()[-400:]}")
 
 
-def plan_summary(model_dir):
+def plan_summary(model_dir, ctx=0):
     """The real planner on the downloaded files: (one line, warnings)."""
     try:
         from resource_plan import build_plan
-        plan = build_plan(model_dir)
+        plan = build_plan(model_dir, context=ctx) if ctx else build_plan(model_dir)
     except Exception as error:  # the plan is advice here; `coli plan` reports it fully
         return f"plan not available ({error})", []
     ram = plan["tiers"]["ram"]
@@ -1739,6 +1797,12 @@ def cmd_setup(a, ui=None):
             except KeyError:
                 seeded = None      # a model given by folder: no catalog entry, no profile
             seed_expert_profile(seeded, cfg.get("model_dir"), out=ui.say)
+            ctx = getattr(a, "ctx", 0)
+            if ctx:
+                check_ctx(ctx, family_by_id(cfg.get("family")))
+                cfg = dict(cfg, args=_replace_arg(cfg["args"], "--ctx", str(ctx)))
+                save_config(cfg)
+                ui.say(f"  context: {ctx} tokens from now on")
             refresh_configured(cfg, out=ui.say)
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
@@ -1837,13 +1901,15 @@ def cmd_setup(a, ui=None):
     if not web_dist_dir(engine_info["launcher_dir"]):
         ensure_web_dist(engine_info["launcher_dir"], current_version(), out=ui.say)
 
-    line, warnings = plan_summary(model_dir)
+    ctx = getattr(a, "ctx", 0)
+    check_ctx(ctx, family)
+    line, warnings = plan_summary(model_dir, ctx)
     ui.say(f"\nPlan: {line}")
     for warning in warnings:
         ui.say(f"  plan warning: {warning}")
 
     cfg = make_config(model_dir=model_dir, family=family, entry=entry, engine_info=engine_info,
-                      hw=hw, host=host, port=port)
+                      hw=hw, host=host, port=port, ctx=ctx)
     cfg["requested_backend"] = requested
     # A GPU this setup found but could not build for: a rerun checks whether
     # the packages arrived and rebuilds (gpu_now_buildable).
