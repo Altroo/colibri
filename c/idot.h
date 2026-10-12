@@ -628,7 +628,7 @@ static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
         const __m128i *blk=(const __m128i*)(w4+(i>>1));
         __m128i b0=_mm_loadu_si128(blk);
         __m128i b1=_mm_loadu_si128(blk+1);
-        /* maddubs(u8, s8): u<=15, |x|<=127 -> coppia <= 3810, int16 sicuro */
+        /* maddubs(u8,s8): u<=15, |x|<=127 -> pair <= 3810, int16-safe */
         __m128i p0=_mm_maddubs_epi16(_mm_and_si128(b0,m4),
                                      _mm_loadu_si128((const __m128i*)(x+i)));
         __m128i p1=_mm_maddubs_epi16(_mm_and_si128(b1,m4),
