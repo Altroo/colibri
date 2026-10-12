@@ -583,7 +583,7 @@ trunk on the CPU as **int8 rows with one scale per row** (the format the
 tier uploads, so GPU or not the rows are the same bytes), releases the BF16
 copy once the rows exist, and multiplies with the integer kernels of
 `idot.h`: the activation is quantized to int8 once per row and meets the
-weights with maddubs / vpdpbusd (AVX2 / AVX-512 VNNI) or NEON dot products.
+weights with maddubs (SSSE3 / AVX2), vpdpbusd (AVX-512 VNNI) or NEON dot products.
 Decode and prefill take this path. Every matrix of at least
 `Q38_TRUNK_MIN_KB` (default 1 MiB) is in; the small ones stay BF16 because
 they cost nothing either way. `Q38_TRUNK_CPU_INT8=0` keeps the BF16 rows and
