@@ -3653,7 +3653,7 @@ def main():
     pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
     pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
     pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
-    pset.add_argument("--ctx",type=int,default=0,metavar="TOKENS",
+    pset.add_argument("--ctx",type=int,default=None,metavar="TOKENS",
                       help="context the server starts with, kept for `coli start` (0: automatic, "
                       "from the memory there is)")
     pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
