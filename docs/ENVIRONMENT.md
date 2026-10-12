@@ -632,6 +632,7 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `SMOOTH` | `0.3` | EMA factor for routing momentum (gate logits smoothed across tokens). Clamped to [0, 0.95]. |
 | `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
+| `FUSED3` | `0` (off) | `=1` together with `IDOT=1`: AVX2 fused activation-quant + gate/up kernels for the routed experts. They are bit-identical to the `IDOT=1` path, which quantizes activations to Q8_0 and is lossy against the default path (#1044); with `IDOT` unset `FUSED3` does nothing and the exact path runs. |
 | `COLI_VULKAN` | `0` | `VK=1` build: attention, router and lm_head on the Vulkan device, and the routed experts (int8 rows) on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). The warm start reads the history `COLI_USAGE` names; without it the tier fills as experts pass by. |
 
 ## Laya engine (`laya`)
