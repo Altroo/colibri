@@ -807,6 +807,26 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* The subgroup size a device's pipelines run at (vk_pin_sg, 0 = the driver's choice).
+ * The GEMV shaders (qmatmul, qmatmul_gate_up, the expert batch's) size their reductions
+ * by gl_SubgroupSize, as the chain's do; an Intel GPU compiles a shader at 8, 16 or 32
+ * lanes by its register pressure. Only the chain's pipelines were pinned (#1954): on
+ * Mesa ANV every expert-tier format but int3-g64 came out wrong and qwen36 answered
+ * nothing (#2036), while the chain alone passed. Pinned here too. */
+static int dev_pin_sg(VkDevice dev);
+static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *pin_info(VkDevice dev,
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *rss) {
+#ifdef VK_EXT_subgroup_size_control
+    int n = dev_pin_sg(dev);
+    if (n <= 0) return NULL;
+    *rss = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)n};
+    return rss;
+#else
+    (void)dev; (void)rss; return NULL;
+#endif
+}
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
@@ -824,8 +844,9 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
     VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
     VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
@@ -3669,6 +3690,7 @@ typedef struct XbCtx {
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
+static int dev_pin_sg(VkDevice dev) { return dev == G.dev ? G.pin_sg : dev == G2.dev ? G2.pin_sg : 0; }
 struct PCV4 { int rows, n; };
 struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
 #define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
@@ -3788,9 +3810,10 @@ static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescrip
     return 1;
 }
 static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const VkSpecializationInfo *si, VkPipeline *pipe) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(X->dev, &rss),
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
     VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
     return 1;
 }
