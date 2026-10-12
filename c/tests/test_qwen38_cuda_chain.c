@@ -67,6 +67,21 @@ int main(void) {
     tk(fake_chain_frames == 0, "no frame reached the card");
     qt_shutdown();
 
+    printf(" MTP draft rejection with the chain on the fake card\n");
+    setenv("SNAP", "./qwen38_tiny_fp8_mtp", 1);
+    setenv("Q38_MTP", "1", 1);
+    setenv("Q38_MTP_FORCE", "reject", 1);
+    argv[3] = (char *)"./qwen38_tiny_fp8_mtp/ref.json";
+    setenv("COLI_CUDA_CHAIN", "1", 1);
+    fake_chain_frames = 0; fake_chain_fail_at = 0; fake_dn_snapshots = 0;
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0, "rejected MTP drafts roll back and remain within the oracle's limits");
+    tk(fake_chain_frames > 8, "rejected MTP verification ran through chain frames");
+    tk(fake_dn_snapshots > 0, "MTP verification wrote DeltaNet chain snapshots");
+    unsetenv("Q38_MTP_FORCE");
+    setenv("Q38_MTP", "0", 1);
+    qt_shutdown();
+
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");
     return 0;

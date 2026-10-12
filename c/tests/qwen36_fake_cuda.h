@@ -154,6 +154,7 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const vo
 struct ColiCudaDn { int device, vh, vk, kdim, vdim, conv_dim, convk, hidden; float eps; int gate_sigmoid;
                     float *ring, *rec, *conv_w, *norm_w; };
 static int fake_dn_steps, fake_dn_fail;
+static int fake_dn_snapshots; /* chain MTP tests: prove verify snapshots were written */
 static void fake_gemv_i8(float *y, const float *x, const ColiCudaTensor *t) {
     const int8_t *q = (const int8_t *)t->w;
     for (int o = 0; o < t->O; o++) { float a = 0.f; const int8_t *w = q + (size_t)o * t->I;
@@ -371,6 +372,7 @@ static int fcc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf
 static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     if (!fcc_ready() || !in || !w || !ring || !out || !p || (p->snap_row >= 0 && !snap)) return 0;
     fake_chain_ops++;
+    if (p->snap_row >= 0) fake_dn_snapshots++;
     int nh = p->CK - 1;
     for (int c = 0; c < p->CD; c++) {
         float hist[8] = {0};
@@ -393,6 +395,7 @@ static float fcc_softplus(float x) { if (x > 20.f) return x; float e = expf(x); 
 static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
     if (!fcc_ready() || !cv || !ab || !z || !st || !prm || !y || !p || (p->snap_row >= 0 && !snap) || KD > 256 || p->VD > 128) return 0;
     fake_chain_ops++;
+    if (p->snap_row >= 0) fake_dn_snapshots++;
     for (int h = 0; h < p->VH; h++) {
         int kh = h / (p->VH / p->KH);
         float *S = st->d + p->st_off + h * KD * p->VD;

@@ -1526,7 +1526,7 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 # plus BF16 128x128 block scales, gate/up and down in separate shards. The
 # native slab path and the expanded path must both reproduce the reference;
 # then the engine runs on the fake CUDA tier (no toolkit, no GPU).
-.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-cuda-chain-check
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-mtp-generate qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-cuda-chain-check
 qwen38-tiny-fp8-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
 
@@ -1543,8 +1543,11 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
 	./tests/test_qwen38_dn_gpu$(EXE)
 
-qwen38-cuda-chain-check: qwen38-tiny-fp8-generate tests/test_qwen38_cuda_chain$(EXE)
+qwen38-cuda-chain-check: qwen38-tiny-fp8-generate qwen38-tiny-fp8-mtp-generate tests/test_qwen38_cuda_chain$(EXE)
 	./tests/test_qwen38_cuda_chain$(EXE)
+
+qwen38-tiny-fp8-mtp-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8_mtp --fp8-experts --mtp
 
 # The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
 # the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
