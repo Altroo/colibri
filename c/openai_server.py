@@ -3876,6 +3876,7 @@ GENERIC_JSON_GBNF = (
 )
 
 DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+DEFAULT_QWEN36_CHAT_STOP_SEQUENCES = ("<|im_end|>", "<|im_start|>")
 
 # Seconds to wait for the engine to exit on its own after stdin EOF (its
 # atexit teardown writes HEAT_FILE). EOF is only observed between turns,
@@ -4121,6 +4122,12 @@ def stop_policy(body, chat):
         # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and ARCH == "qwen36" and not sequences:
+        # KAT normally ends with the special im_end token, which the native
+        # engine handles by token id. Quantized checkpoints can instead spell
+        # the marker as ordinary text pieces. Keep that template boundary out
+        # of OpenAI responses without overriding an explicit client stop.
+        return DEFAULT_QWEN36_CHAT_STOP_SEQUENCES, ignore_leading
     return sequences, ignore_leading
 
 
