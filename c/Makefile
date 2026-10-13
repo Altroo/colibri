@@ -1037,13 +1037,25 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
 # needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
 # patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
+# DSV4_TC=0 leaves out the opt-in cuBLASLt MXFP8 path (DSV4_CUDA_TC=1 at run
+# time): the DLL then links no cuBLASLt and needs only cudart64_12.dll beside it
+# and the NVIDIA driver -- the form the Windows CUDA package ships (#2047):
+# cublasLt64_12.dll alone is hundreds of MB.
+DSV4_TC ?= 1
+ifeq ($(DSV4_TC),0)
+DSV4_DLL_TC = -DCOLI_DSV4_NO_TC
+DSV4_DLL_LIBS = -lcudart -lcuda
+else
+DSV4_DLL_TC =
+DSV4_DLL_LIBS = -lcublasLt -lcudart -lcuda
+endif
 cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
-	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
+	"$(NVCC)" $(NVCCFLAGS) $(DSV4_DLL_TC) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
 		-Xlinker /DEF:dsv4.def \
-		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
 
 # The DeepGEMM sm120 headers come from tools/fetch_deepgemm.sh (pinned
@@ -1055,10 +1067,10 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
-		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
+		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM $(DSV4_DLL_TC) \
 		$(DEEPGEMM_INC) -shared \
 		-Xlinker /DEF:dsv4.def \
-		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
 
 # Windows: the decode-path kernels validated through the runtime DLL loader.
