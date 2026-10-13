@@ -676,7 +676,7 @@ class DiagnosticHarness:
 def main():
     ap = argparse.ArgumentParser(description="Comprehensive model diagnostic harness for colibri GLM-5.2")
     ap.add_argument("--snap", required=True, help="model snapshot directory")
-    ap.add_argument("--glm", default=None, help="engine binary path (default: ./glm.exe or ./glm)")
+    ap.add_argument("--glm", default=None, help="engine binary path (default: auto-detect colibri/colibri.exe)")
     ap.add_argument("--phase", default="all",
                     choices=["all","system","smoke","diagnostic","quality","throughput"],
                     help="which test phase to run")
@@ -691,10 +691,19 @@ def main():
     a = ap.parse_args()
     # Auto-detect engine binary
     if a.glm is None:
-        for cand in ["./glm.exe", "./glm", "../glm.exe", os.path.join(os.path.dirname(__file__), "..", "glm.exe")]:
-            if os.path.exists(cand): a.glm = os.path.abspath(cand); break
+        directories = (Path.cwd(), Path.cwd().parent, Path(__file__).resolve().parent.parent)
+        names = (("colibri.exe", "colibri", "glm.exe", "glm") if sys.platform == "win32"
+                 else ("colibri", "colibri.exe", "glm", "glm.exe"))
+        for name in names:
+            for directory in directories:
+                candidate = directory / name
+                if candidate.is_file():
+                    a.glm = str(candidate.resolve())
+                    break
+            if a.glm is not None:
+                break
         if a.glm is None:
-            print("ERROR: could not find glm/glm.exe. Specify with --glm", file=sys.stderr); sys.exit(1)
+            print("ERROR: could not find colibri/colibri.exe. Specify with --glm", file=sys.stderr); sys.exit(1)
     if not os.path.isdir(a.snap):
         print(f"ERROR: snapshot dir does not exist: {a.snap}", file=sys.stderr); sys.exit(1)
     harness = DiagnosticHarness(a)
