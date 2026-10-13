@@ -4319,6 +4319,16 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
+    /* Serve mode can split a long prompt across several calls so CANCEL is
+     * observed during prefill.  Intermediate chunks have already advanced all
+     * model state, but do not need an expensive vocabulary projection yet.
+     * Keep first_step/resident collection open until the final chunk. */
+    if (nlogits == 0) {
+        if (tm_on()) { if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
+        free(x);
+        if (lf) fclose(lf);
+        return NULL;
+    }
     /* Lettura del prefill: una passata di lm_head per posizione, pagata SOLO
      * dalle richieste che hanno chiesto il canale. La posizione p predice il
      * token p+1, quindi si copre l'intero blocco fresco tranne il suo primo
@@ -5297,6 +5307,7 @@ static int serve_eos_ids(int *ids, int cap){
  *
  * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai. */
+static int g_q36_mux_slots = 1;
 enum { Q36_CONTROL_NONE, Q36_CONTROL_STOP, Q36_CONTROL_CANCEL };
 static int serve_control_pending(const char *id){
     int control = Q36_CONTROL_NONE;
@@ -5309,6 +5320,18 @@ static int serve_control_pending(const char *id){
         else if(!strcmp(cmd,"STOP") && control == Q36_CONTROL_NONE) control = Q36_CONTROL_STOP;
     }
     return control;
+}
+
+/* A long CPU prompt used to be one uninterruptible step(): the gateway sent
+ * CANCEL as soon as its client disappeared, but this process did not read the
+ * command until prefill had finished.  Bound the serve-only prefill work so
+ * every chunk is also a cancellation point.  The operator knob is mainly for
+ * regression tests and slow hardware; zero disables chunking. */
+static int serve_prefill_chunk_rows(int rows){
+    const char *value = getenv("QWEN36_SERVE_PREFILL_CHUNK");
+    int chunk = value ? atoi(value) : 128;
+    if(chunk <= 0 || chunk > rows) return rows;
+    return chunk;
 }
 
 /* --- Dashboard: Brain e Profile ------------------------------------------
@@ -5457,7 +5480,44 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
                (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
-    float *lo = step(m, ids + reuse, np - reuse, reuse);
+    int fresh = np - reuse;
+    int chunk = (g_q36_mux_slots > 1 || q->logprobs > 0 || getenv("DUMP_LAYERS") || m->vis_rows
+                 || qt_ready() || qq_active())
+              ? fresh : serve_prefill_chunk_rows(fresh);
+#ifdef COLI_VULKAN
+    if (g_vk_ready || vkt_ready()) chunk = fresh;
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) chunk = fresh;
+#endif
+    int fed = 0, prefill_control = Q36_CONTROL_NONE;
+    float *lo = NULL;
+    while(fed < fresh){
+        /* Check before the first chunk too: CANCEL may already be buffered by
+         * the time tokenization and cache preparation finish. */
+        /* The multiplexed loop owns its command stream: this single-slot
+         * poll would discard another slot's SUBMIT or IMAGE payload. */
+        if(g_q36_mux_slots == 1 &&
+           (prefill_control = serve_control_pending(q->id)) != Q36_CONTROL_NONE) break;
+        int rows = fresh - fed;
+        if(rows > chunk) rows = chunk;
+        int final_chunk = fed + rows == fresh;
+        lo = step_ex(m, ids + reuse + fed, rows, reuse + fed, final_chunk);
+        fed += rows;
+    }
+    /* A disconnect during the final chunk must be honored before the first
+     * DATA frame; otherwise a closed client still receives one token before
+     * the engine notices the queued CANCEL. */
+    if(g_q36_mux_slots == 1 && !prefill_control) prefill_control = serve_control_pending(q->id);
+    if(prefill_control){
+        free(lo);
+        g_echo_k = 0; g_echo_id = NULL;
+        if(prefill_control == Q36_CONTROL_CANCEL) printf("ERROR %s CANCELLED\n",q->id);
+        else printf("DONE %s STAT 0 0.000 0.0 %.2f %d 0\n",q->id,rss_gb(),np);
+        fflush(stdout);
+        free(ids);
+        return 0;
+    }
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
@@ -5876,7 +5936,6 @@ static int q36_clef_test_modes(Model *m){
  * them. A request's frames are a lone request's; they interleave by id. Nothing
  * drafts (speculation follows one conversation). STOP finishes with DONE; CANCEL
  * ends with ERROR CANCELLED, as in serve_one. A Clef DECIDE runs at once on its slot. */
-static int g_q36_mux_slots = 1;
 static Q36Seq *g_q36_mux_seq;   /* [slots]: the conversations the Model does not hold */
 static int g_q36_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
 
