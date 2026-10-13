@@ -31,6 +31,11 @@ import os, sys, re, json, time, argparse, subprocess, signal, traceback
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from tools.engine_environment import engine_environment
+except ModuleNotFoundError:              # direct execution from c/tools
+    from engine_environment import engine_environment
+
 # ---------------------------------------------------------------------------
 # PROMPT SUITE — curated across categories.  "expect" is a case-insensitive
 # substring checked against the generated text (None = coherence-only check).
@@ -185,7 +190,7 @@ class EngineRunner:
 
     def run_prompt(self, prompt, ngen=64, env_extra=None, log_name=None, cap=None):
         """Run the engine in PROMPT mode and return (stdout, stderr, returncode, elapsed)."""
-        env = dict(os.environ, SNAP=self.snap, PROMPT=prompt, NGEN=str(ngen))
+        env = engine_environment(SNAP=self.snap, PROMPT=prompt, NGEN=str(ngen))
         env.update(self.default_env)
         if env_extra: env.update(env_extra)
         env["TOKENS"] = "1"   # always capture token ids for reliable text extraction
@@ -194,7 +199,7 @@ class EngineRunner:
 
     def run_score(self, score_file, cap=None, env_extra=None, log_name=None):
         """Run the engine in SCORE (log-likelihood) mode."""
-        env = dict(os.environ, SNAP=self.snap, SCORE=score_file)
+        env = engine_environment(SNAP=self.snap, SCORE=score_file)
         env.update(self.default_env)
         if env_extra: env.update(env_extra)
         cmd = [self.glm, str(cap if cap is not None else self.default_cap)]
