@@ -1197,7 +1197,7 @@ def equivalent_command(cfg):
 
 def _quote(value):
     value = str(value)
-    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value)
+    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- server control

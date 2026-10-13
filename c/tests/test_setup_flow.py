@@ -1005,6 +1005,52 @@ class WholeSetup(HomeTestCase):
                               setup_args(dir=self.models, **overrides))
         return code, out.getvalue()
 
+    def _assert_same_as_command_preserves_paths(self, model_name, engine_name=None):
+        self.models = os.path.join(self.tmp.name, model_name)
+        if engine_name:
+            new_engine_dir = os.path.join(self.tmp.name, engine_name)
+            os.rename(self.engines, new_engine_dir)
+            self.engines = new_engine_dir
+            patcher = mock.patch.object(setup_flow, "HERE", self.engines)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        command = next(line for line in text.splitlines() if "same as:" in line).split("same as:", 1)[1].strip()
+        bindir = Path(self.tmp.name, "bin")
+        bindir.mkdir()
+        launcher = bindir / "coli"
+        launcher.write_text(
+            "#!" + sys.executable + "\nimport os, sys, json\n"
+            + "keys = " + repr(list(cfg["env"])) + "\n"
+            + "print(json.dumps({'args': sys.argv[1:], 'env': {key: os.environ.get(key) for key in keys}}))\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        # Native shell and argv consumer; no engine or model is invoked.
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={"PATH": str(bindir) + ":/usr/bin:/bin", "HOME": self.tmp.name},
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        consumed = json.loads(result.stdout)
+        self.assertEqual(consumed["args"], cfg["args"])
+        self.assertEqual(consumed["env"], cfg["env"])
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_unicode_model_directory(self):
+        self._assert_same_as_command_preserves_paths("模型 é")
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_unicode_shader_directory(self):
+        self._assert_same_as_command_preserves_paths("models", "引擎 é")
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_ascii_space_directory(self):
+        self._assert_same_as_command_preserves_paths("local models")
+
     def test_install_then_rerun(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)
