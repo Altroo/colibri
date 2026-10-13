@@ -1744,7 +1744,10 @@ jobs:
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
           # runtime headers/import lib ship as a separate installer component —
           # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
-          sub-packages: '["nvcc", "cudart"]'
+          # cuda_profiler_api and thrust (CCCL) for DeepSeek V4's DLLs: its
+          # backend includes cuda_profiler_api.h, and the DeepGEMM flavour's
+          # CUTLASS headers the CCCL ones; neither comes with nvcc or cudart.
+          sub-packages: '["nvcc", "cudart", "cuda_profiler_api", "thrust"]'
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64

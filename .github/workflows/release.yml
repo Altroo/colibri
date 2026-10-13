@@ -424,7 +424,8 @@ jobs:
         with:
           cuda: '12.8.1'
           method: network
-          sub-packages: '["nvcc", "cudart"]'
+          # cuda_profiler_api and thrust (CCCL): DeepSeek V4's DLLs (ci.yml, windows-cuda-build)
+          sub-packages: '["nvcc", "cudart", "cuda_profiler_api", "thrust"]'
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
