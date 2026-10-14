@@ -13172,8 +13172,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         }
         vkt_put_done();
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        fprintf(stderr, "[VK] tier deepseek_v4: warm start, %d experts from the history in %.1fs\n", n,
-                (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
+        vkt_warm_report("deepseek_v4", n, (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
     }
     free(pl); free(pe);
     coli_v4_expert_store_device_tier = v4_vkt_device_tier;

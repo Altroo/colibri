@@ -2026,7 +2026,7 @@ static void ink_vk_tier_start(Model *m) {
                     ink_vk_tmp_free(&tmp);
                 }
                 vkt_put_done();
-                fprintf(stderr, "[VK] tier inkling: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+                vkt_warm_report("inkling", n, now_s() - t0);
             }
             free(pl); free(pe);
         }

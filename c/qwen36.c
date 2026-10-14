@@ -6262,7 +6262,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
         }
         vkt_put_done();
-        fprintf(stderr, "[VK] tier qwen36: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+        vkt_warm_report("qwen36", n, now_s() - t0);
     }
     free(pl); free(pe);
 }

@@ -979,7 +979,7 @@ static void olmoe_vk_tier_start(Model *m) {
             free(tmp.g); free(tmp.gs);   /* the two blocks slot_ensure_allocated made */
         }
         vkt_put_done();
-        fprintf(stderr, "[VK] tier olmoe: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+        vkt_warm_report("olmoe", n, now_s() - t0);
     }
     free(pl); free(pe);
 }

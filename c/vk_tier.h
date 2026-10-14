@@ -69,7 +69,8 @@
  *    must share one kind. A layer the tier should not serve (an MTP layer in another
  *    format) is simply never passed to vkt_issue: index layers 0..layers-1 only.
  *
- * 2. Warm start (optional, recommended when there is history): the tier plans, the
+ * 2. Warm start (recommended: with a history the hottest go first, and the rest of the
+ *    device is filled either way, COLI_VK_TIER_FILL): the tier plans, the
  *    engine reads each planned expert from disk (any number of threads) and hands
  *    it over, then publishes on the engine thread:
  *
@@ -216,6 +217,9 @@ int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
+/* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what
+ * came from the history and what filled the rest of the device (vkt_plan). */
+void vkt_warm_report(const char *engine, int n, double seconds);
 int  vkt_put(int layer, int eid, const VktExpertSrc *src);   /* any thread */
 void vkt_put_done(void);
 void vkt_note(int layer, int eid, const VktExpertSrc *src);
@@ -269,6 +273,7 @@ static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(voi
 static inline int  vkt_ready(void){return 0;}
 static inline void vkt_shutdown(void){}
 static inline int  vkt_plan(int *l,int *e,int m){(void)l;(void)e;(void)m;return 0;}
+static inline void vkt_warm_report(const char *e,int n,double s){(void)e;(void)n;(void)s;}
 static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;return 0;}
 static inline void vkt_put_done(void){}
 static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}

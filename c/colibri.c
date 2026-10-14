@@ -11013,7 +11013,7 @@ static void vk_tier_start(Model *m){
         vkt_put_done();
         for(int t=0;t<nt;t++) vk_tmp_slot_free(&tmp[t],vk_experts_rtq(m,pl));
         free(tmp);
-        fprintf(stderr,"[VK] tier colibri: warm start, %d experts from the history in %.1fs\n",n,now_s()-t0);
+        vkt_warm_report("colibri", n, now_s() - t0);
     }
     free(ql); free(qe);
 }
