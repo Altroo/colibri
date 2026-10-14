@@ -54,6 +54,7 @@ d2_check() {
 # <runner> <tokens out> <log> <env...> runs the engine once and writes what its CPU and
 # Vulkan runs must share (tokens, ids) to <tokens out>.
 d2_case() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local eng=$1 run=$2 tag=$3 kind=$4; shift 4
   local x=()
   local D2_X=1 D2_SMALL=0

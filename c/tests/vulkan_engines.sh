@@ -358,6 +358,7 @@ dense_where() {
 # can end before the uploader thread is first scheduled (it did in 5 of 40 runs with
 # the trunk on the CPU), so the gate waits for each staged upload at the next step.
 tier_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local eng=$1 tag=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f tier.usage
@@ -974,6 +975,7 @@ family_deepseek() {
   # must also have evicted. COLI_USAGE points at a fresh history, COLI_VK_TIER_SYNC=1
   # awaits each staged upload at the next step (as in tier_gate).
   v41_tier() {  # <tag> <env and argv...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1; shift
     rm -f tier.usage
     env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 tier $tag: CPU run"; }
@@ -1046,6 +1048,7 @@ sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
 gen.main()
 PY
   v4_tier() {  # <tag> <fixture> <case> <env...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 fx=$2 c=$3; shift 3
     local p mt
     p=$($PY -c 'import json,sys; c=json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))' $fx $c)
@@ -1187,6 +1190,7 @@ family_kimi() {
   # k3_gate <tag> <env...>: the tokens of the CPU run, the tier served some experts,
   # the shared experts where they were asked to be (dense_where); EVICT=1: it evicted
   k3_gate() {
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 c; shift
     for c in short chunk long; do
       rm -f k3.usage
@@ -1475,6 +1479,7 @@ glm_fixtures() {
 # greedy run (the warm start, and the device in a teacher-forced prefill). DEV2=1: the
 # second device's registry served experts ("+ N vk" in the hit-rate line).
 glm_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 snap=$2 ref=$3; shift 3
   local envs=() pre=() e; while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   for e in "${envs[@]}"; do [ "${e%%=*}" = TF ] || pre+=("$e"); done
@@ -1502,6 +1507,7 @@ glm_tier() {
 # teacher_forcing and greedy lines; the history is a fresh COLI_USAGE file (HIST=1: one
 # greedy run writes it first).
 g53_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 model=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f g53.usage
@@ -2416,6 +2422,7 @@ PY
 # forward), and the run must say so; REBUILD=1: and rebuild the KDA state of some
 # positions on the CPU.
 k3c_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 c frames fault; shift
   for c in ${K3C_CASES:-short chunk long}; do
     rm -f k3c.usage cpu.f32 vk.f32
@@ -2673,6 +2680,7 @@ v4_chain_same() {
   echo "OK $tag (${c%%:*}): $A and $B: the same ids and the same logits bit for bit ($(($(wc -c < v4-a.f32) / 4)) values), $(chain_count deepseek_v4 v4-b.err) chain forwards"
 }
 v4_chain_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 fx=$2 c=$3; shift 3
   local p mt lg frames fault=()
   p=$(v4_chain_prompt "$fx" "$c")
@@ -3240,7 +3248,9 @@ done
 #   off       COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0, the
 #             build before's behaviour: the CPU's tokens, nothing streamed.
 # <family>-sanitize runs the forced configurations under ASan and UBSan.
-PF_FORCE="COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
+# (COLI_VK_TIER_FILL=0: the warm start takes the history alone, or a fixture's experts would
+# all be resident and nothing would be cold enough to stream)
+PF_FORCE="COLI_VK_TIER_FILL=0 COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
 PF_OFF="COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0"
 stream_count() {   # <engine> <log>: cold experts streamed in the run (the last report)
   local n; n=$(sed -n "s/^\[VK\] tier $1 run: .* stream: [0-9]* steps, \([0-9]*\) cold experts.*/\1/p" "$2" | tail -1)
