@@ -370,7 +370,8 @@ static struct {
     VkCoopTile coop_t[VK_COOP_SLOTS];
     int gemm_min_s, gemm_min_so, has_coop, coop_sg, coop_off;
     int pin_sg;            /* the subgroup size the chain pins its pipelines to (vk_pin_sg); 0 = none */
-    int has_bda;           /* bufferDeviceAddress on: the expert batch's grouped GEMM reads weights by address */
+    int has_bda;           /* bufferDeviceAddress on: the grouped GEMM (with the matrix units) and the chain's
+                            * routed experts (chain_moe.comp) read the tier's weights by address */
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
@@ -1185,9 +1186,37 @@ int coli_vk_init(const char *spv_path) {
         if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
     }
 #endif
+    /* bufferDeviceAddress without the matrix units: the dense chain's routed experts read
+     * the tier's weights by address (chain_moe.comp). COLI_VK_BDA=0 leaves it off; a
+     * device that refuses it comes up without it. */
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    const void *di_next = di.pNext;
+    if (!G.dev) {
+        const char *be = getenv("COLI_VK_BDA");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+        G.has_bda = 0;
+        if (pp.apiVersion >= VK_API_VERSION_1_2 && !(be && *be == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &bdaf};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            if (bdaf.bufferDeviceAddress) {
+                bdaf = (VkPhysicalDeviceBufferDeviceAddressFeatures){
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+                    .pNext = (void *)di.pNext, .bufferDeviceAddress = VK_TRUE};
+                di.pNext = &bdaf;
+                G.has_bda = 1;
+            }
+        }
+    }
     /* the cooperative-matrix device enables subgroup size control already */
     G.pin_sg = vk_pin_sg(G.phys, has_ssc);
-    if (!G.dev && G.pin_sg && !vk_create_device_pinned(G.phys, &di, &G.dev)) G.pin_sg = 0;
+    for (int bda = G.has_bda; !G.dev; bda = 0) {
+        if (G.pin_sg && !vk_create_device_pinned(G.phys, &di, &G.dev)) G.pin_sg = 0;
+        if (!G.dev && vkCreateDevice(G.phys, &di, NULL, &G.dev) != VK_SUCCESS) G.dev = VK_NULL_HANDLE;
+        if (G.dev || !bda) break;
+        di.pNext = di_next; G.has_bda = 0;   /* again without the addresses */
+        G.pin_sg = vk_pin_sg(G.phys, has_ssc);
+    }
     if (!G.dev)
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
     vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
@@ -4262,6 +4291,21 @@ static uint64_t vk_addr(VkBuffer b) {
  * rows start at the same row index past the batch's bases x0, i0, y0 (its scratch half),
  * which the sets bind as their offsets. `slot`: whose tables and sets (0 the single
  * batch, 1 + h a sub-batch half). 0 = not taken, nothing recorded. */
+int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *o) {
+    if (!e || !o || !G.ready || !G.has_bda) return 0;
+    const ColiVkTensor *t[3] = {e->g, e->u, e->d};
+    for (int k = 0; k < 3; k++) if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || !t[k]->sbuf) return 0;
+    memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+    for (int k = 0; k < 3; k++) {
+        uint64_t w = vk_addr(t[k]->wbuf), s = vk_addr(t[k]->sbuf);
+        o[4 * k] = (uint32_t)w; o[4 * k + 1] = (uint32_t)(w >> 32);
+        o[4 * k + 2] = (uint32_t)s; o[4 * k + 3] = (uint32_t)(s >> 32);
+    }
+    o[12] = (uint32_t)t[0]->fmt; o[13] = (uint32_t)t[0]->rowWords; o[14] = (uint32_t)t[0]->gs;
+    o[15] = (uint32_t)t[2]->fmt; o[16] = (uint32_t)t[2]->rowWords; o[17] = (uint32_t)t[2]->gs;
+    o[18] = 1;
+    return 1;
+}
 /* Whether the grouped route takes this batch (and its row total). */
 /* Whether the grouped route takes this batch (and its row total): 1 the grouped GEMM
  * (grp_rows rows or more), 2 the grouped GEMV (fewer), 0 neither. */
@@ -5182,6 +5226,7 @@ int coli_vk_core(ColiVkCore *o) {
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
     o->coop_sg = G.has_coop ? G.coop_sg : 0;
     o->pin_sg = G.pin_sg;
+    o->bda = G.has_bda;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {

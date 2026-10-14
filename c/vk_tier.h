@@ -267,6 +267,20 @@ int  vkt_layers(void);
  * Any thread (the prefetch workers too): it reads the slot table without the engine. */
 int  vkt_ram_first(int layer, int eid);
 void vkt_ram_gave(void);
+/* The routed experts on the device (vk_chain.h, vkc_moe): an engine whose dense chain
+ * routes and computes a layer's experts there, with no host step, for the layers whose
+ * experts the tier holds on the primary device.
+ *   vkt_epoch       changes whenever a resident comes or goes (the engine thread's
+ *                   quiescent points: a vkt_issue, vkt_join, vkt_note or vkt_put_done);
+ *                   residents stay put between two of them
+ *   vkt_dev_table   layer's E entries for vkc_moe (COLI_VK_XB_ENTRY words each, a zero
+ *                   entry where the expert is not resident there); returns how many are,
+ *                   -1 when the device cannot read them by address
+ *   vkt_dev_count   the books for S rows of K experts the device computed (idx as
+ *                   vkt_issue's): heat, routed and served, as a vkt_issue that took them */
+unsigned vkt_epoch(void);
+int  vkt_dev_table(int layer, uint32_t *entries);
+void vkt_dev_count(int layer, int S, int K, const int *idx);
 #else
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
@@ -292,6 +306,9 @@ static inline int  vkt_devices(void){return 0;}
 static inline int  vkt_layers(void){return 0;}
 static inline int  vkt_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_ram_gave(void){}
+static inline unsigned vkt_epoch(void){return 0;}
+static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
+static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 #endif
 
 #endif
