@@ -473,8 +473,11 @@ static Q38Chain *q38c_new_dev(Model *m, int d) {
 }
 static Q38Chain *q38c_new(Model *m) { return q38c_new_dev(m, 0); }
 /* Every layer the fit gave the device, one at a time (its matrices, its state), then the
- * parameters, the placed line and the head. A partial chain runs it at startup
- * (q38c_start), the full chain at its first forward, as before. */
+ * parameters, the placed line and the head. Run at startup (q38c_start), partial or full:
+ * before the expert tier reads the free memory, so the tier's budget leaves the chain its
+ * state, caches and parameters (#2081: a full chain set up at its first forward found
+ * the device filled by the tier, was refused its parameter buffer and turned itself off,
+ * leaving the CPU to read the trunk back from disk). */
 /* d = 1: the second device's chain (the caller has made that device current). */
 static Q38Chain *q38c_setup_dev(Model *m, int d) {
     Q38Chain *ch = q38c_of(m, d);
@@ -522,10 +525,11 @@ static Q38Chain *q38c_setup(Model *m) { return q38c_setup_dev(m, 0); }
 static int q38c_layers(Model *m) { (void)m; return g_q38c_ran; }
 
 /* At startup, with the chain on (before anything of it is on the device, the dense-host
- * pass and the expert tier): N, the chain's pipelines (vkc_init), and a partial chain
- * placed now. N = 0: the chain off, nothing of it on the device, nothing more going up
- * (every byte left to the tier). A model the chain declines keeps today's path (the
- * caller's vkc_init, the decline at its first forward). */
+ * pass and the expert tier): N, the chain's pipelines (vkc_init), and the chain placed
+ * now, partial or full, so the tier sizes itself from what the chain left. N = 0: the
+ * chain off, nothing of it on the device, nothing more going up (every byte left to the
+ * tier). A model the chain declines keeps today's path (the caller's vkc_init, the
+ * decline at its first forward). */
 static void q38c_start(Model *m) {
     if (!g_vk_chain || qt_ready()) return;
     Cfg *c = &m->c; int L = c->layers;
@@ -553,7 +557,6 @@ static void q38c_start(Model *m) {
         vkc_device(0);
     }
     free(lb); free(mb);
-    if (!partial) return;   /* every layer and the head: set up at the first forward, as before */
     Q38Chain *ch = q38c_setup(m);
     if (!ch) { vkc_shutdown(); g_vk_chain = 0; }
     if (g_q38c_fit2_on) {
@@ -583,17 +586,30 @@ static void q38c_dho_bound(int *layers, int *head, int *dev) {
     }
     if (!*layers) *dev = 0;
 }
-/* The dense-host pass with the full chain fitted (the matrices go up at startup in this
- * mode): each layer's matrices go up and their host copies go only once the whole layer
- * is there; a layer that does not get there leaves the chain the layers before it, placed
- * now as a partial chain. Then the placed line, the head, and the MTP head's matrices.
- * 0: not this case, the caller's pass runs. */
+/* The dense-host pass with the full chain fitted. q38c_start placed it whole (its
+ * matrices, state and parameters): the host copies of its layers' matrices and of the
+ * head's go now, as below. Otherwise (a chain not set up yet) each layer's matrices go
+ * up and their host copies go only once the whole layer is there; a layer that does not
+ * get there leaves the chain the layers before it, placed now as a partial chain. Then
+ * the placed line, the head, and the MTP head's matrices. 0: not this case, the caller's
+ * pass runs. */
 static int q38c_dho_place(Model *m, size_t *bytes, int *n) {
     if (!g_q38c_fitted || vkc_fit_partial(&g_q38c_fit) || !g_vk_chain) return 0;
     Q38Chain *ch = (Q38Chain *)m->vkchain;
     if (!ch && !(ch = q38c_new(m))) return 0;
-    if (ch->built) return 0;
     int L = m->c.layers;
+    if (ch->built) {
+        if (!ch->ok || ch->nl != L) return 0;
+        for (int i = 0; i < L; i++) {
+            Q38Weight *w[Q38C_MATS]; int nw = q38c_mats(m, i, w);
+            for (int k = 0; k < nw; k++) q38_dho_drop(w[k], bytes, n);
+        }
+        if (ch->head) {
+            Q38Weight *w[Q38C_TAIL]; int nh = q38c_tail_mats(m, w, 0);
+            for (int k = 0; k < nh; k++) q38_dho_drop(w[k], bytes, n);
+        }
+        return 1;
+    }
     for (int i = 0; i < L; i++) {
         if (!q38c_place_mats(ch, m, i)) {
             q38c_shrink(ch, m, i, vkc_lost() ? "the device was lost" : "the device refused an upload");

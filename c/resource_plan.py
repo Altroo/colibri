@@ -3398,6 +3398,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                  "sockets": max(1, int(cpu_sockets)),
                  "thread_policy": "physical-cores"},
         "memory": {"unified": unified, "available_bytes": available_memory},
+        # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
+        # size themselves from its free memory at start)
+        "vulkan": ({"name": vulkan.get("name"), "type": vulkan.get("type")}
+                   if vulkan and _vk_flag(env_now, "COLI_VULKAN") else None),
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
@@ -3556,6 +3560,10 @@ def format_plan(plan):
             lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
                          f"{format_bytes(vram['budget_bytes'])} hot tier · "
                          f"~{vram['expert_capacity']} experts · {names}")
+    elif plan.get("vulkan"):
+        vk = plan["vulkan"]
+        lines.append(f"VRAM   Vulkan · {vk.get('name') or 'device'} ({vk.get('type') or '?'}) · the expert tier "
+                     "and the dense chain size themselves from its free memory at start")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".

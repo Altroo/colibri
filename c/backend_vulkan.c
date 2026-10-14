@@ -4584,7 +4584,7 @@ int coli_vk_xb_join(const float **yrows, double *device_ms) { return xb_join(&g_
 int coli_vk_xb_join_dev(int dev, const float **yrows, double *device_ms) {
     return dev == 0 || dev == 1 ? xb_join(&g_xb[dev], yrows, device_ms) : 0;
 }
-int coli_vk_xb_busy_dev(int dev) { return (dev == 0 || dev == 1) && g_xb[dev].inflight; }
+int coli_vk_xb_busy_dev(int dev) { return (dev == 0 || dev == 1) && xb_busy(&g_xb[dev]); }   /* a batch or a sub-batch */
 
 static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     memset(st, 0, sizeof(*st));

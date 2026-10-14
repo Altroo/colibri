@@ -117,6 +117,9 @@ static struct {
     int balance, can_balance; float share; unsigned long long handed;
     /* accounting */
     unsigned long long routed, served, steps, uploads, upload_bytes, evictions, qfull, rated, refused, failed, warm;
+    /* failed, by what: the pool refused the expert (no room as it is laid out), the copy
+     * to the device failed, or the batch could not take the uploaded expert's sets */
+    unsigned long long f_pool, f_copy, f_sets;
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -400,9 +403,15 @@ static void quiesce(void) {
     int n = T.ndone; VDone *d = n ? malloc((size_t)n * sizeof(*d)) : NULL;
     if (d) { memcpy(d, T.done, (size_t)n * sizeof(*d)); T.ndone = 0; } else n = 0;
     pthread_mutex_unlock(&T.mx);
+    /* a device whose batch is still in flight cannot take an expert's sets now: what was
+     * uploaded there waits for the next quiet point, rather than being freed and counted
+     * failed (#2081) */
+    const int busy[2] = {coli_vk_xb_busy_dev(0), T.d2 ? coli_vk_xb_busy_dev(1) : 0};
+    int kept = 0;
     for (int i = 0; i < n; i++) {
         VSlot *v = slot(d[i].layer, d[i].eid);
         int dv = v->dev, kd = kind_of(d[i].layer);
+        if (d[i].ok && (dv == 0 || T.d2) && busy[dv ? 1 : 0]) { d[kept++] = d[i]; continue; }
         T.queued--; if (kd) T.xque--; else T.dque[dv]--;
         /* an upload to a second device that has stopped meanwhile (d2_stop) is dropped */
         ColiVkExpert *e = d[i].ok && (dv == 0 || T.d2) ? coli_vk_xb_expert(d[i].g, d[i].u, d[i].d) : NULL;
@@ -415,6 +424,7 @@ static void quiesce(void) {
             v->state = VS_NONE; v->dev = 0;
             if (dv && !T.d2) continue;
             T.failed++;
+            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
              * device ran out first): stop planning past what is there. A failed copy gave
              * its room back: the budget stands, the expert may come again. */
@@ -423,6 +433,27 @@ static void quiesce(void) {
                 T.max_resident -= T.dmax[dv] - (T.dres[dv] + T.dque[dv]);
                 T.dmax[dv] = T.dres[dv] + T.dque[dv];
             }
+        }
+    }
+    if (kept) {   /* back in front of what finished meanwhile, in the order they finished */
+        pthread_mutex_lock(&T.mx);
+        if (T.ndone + kept > T.cdone) {
+            VDone *g = realloc(T.done, (size_t)(T.ndone + kept) * sizeof(*g));
+            if (g) { T.done = g; T.cdone = T.ndone + kept; }
+        }
+        if (T.ndone + kept <= T.cdone) {
+            memmove(T.done + kept, T.done, (size_t)T.ndone * sizeof(*T.done));
+            memcpy(T.done, d, (size_t)kept * sizeof(*d));
+            T.ndone += kept;
+            kept = 0;
+        }
+        pthread_mutex_unlock(&T.mx);
+        for (int i = 0; i < kept; i++) {   /* no memory to keep them: as before, freed and counted */
+            for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            VSlot *v = slot(d[i].layer, d[i].eid);
+            int kd = kind_of(d[i].layer);
+            T.queued--; if (kd) T.xque--; else T.dque[v->dev]--;
+            v->state = VS_NONE; v->dev = 0; T.failed++; T.f_sets++;
         }
     }
     free(d);
@@ -1697,6 +1728,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.failed)
+        fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
+                T.f_pool, T.f_copy, T.f_sets);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",

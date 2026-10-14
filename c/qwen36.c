@@ -4057,27 +4057,28 @@ static void trunk_offer_dense(Model *m){
  * Layer. Every matrix falls back on its own, so a failed upload costs one
  * GEMV on the CPU, never the component. Returns the number of matrices
  * placed; `vram_bytes` gets their size. */
-static int trunk_place_dense(Model *m, double *vram_bytes){
+static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
     Cfg *c = &m->c; int placed = 0; double vram = 0;
+    kinds[0] = kinds[1] = kinds[2] = 0;   /* dnout, attnproj, shexp: the line says which went up */
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         if (!c->is_attn[i]) {
             l->qth_dnout = qdw_place(&l->dn_out, qt_place_of("dnout", i));
-            if (l->qth_dnout) { placed++; vram += (double)qdw_bytes(&l->dn_out); }
+            if (l->qth_dnout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->dn_out); }
         } else {
             int dev = qt_place_of("attnproj", i);
             l->qth_q = qdw_place(&l->q, dev); l->qth_k = qdw_place(&l->k, dev);
             l->qth_v = qdw_place(&l->v, dev); l->qth_o = qdw_place(&l->o, dev);
-            if (l->qth_q) { placed++; vram += (double)qdw_bytes(&l->q); }
-            if (l->qth_k) { placed++; vram += (double)qdw_bytes(&l->k); }
-            if (l->qth_v) { placed++; vram += (double)qdw_bytes(&l->v); }
-            if (l->qth_o) { placed++; vram += (double)qdw_bytes(&l->o); }
+            if (l->qth_q) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->q); }
+            if (l->qth_k) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->k); }
+            if (l->qth_v) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->v); }
+            if (l->qth_o) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->o); }
         }
         int dev = qt_place_of("shexp", i);
         l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
-        if (l->qth_shg) { placed++; vram += (double)qdw_bytes(&l->sh_g); }
-        if (l->qth_shu) { placed++; vram += (double)qdw_bytes(&l->sh_u); }
-        if (l->qth_shd) { placed++; vram += (double)qdw_bytes(&l->sh_d); }
+        if (l->qth_shg) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_g); }
+        if (l->qth_shu) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_u); }
+        if (l->qth_shd) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_d); }
     }
     if (vram_bytes) *vram_bytes = vram;
     return placed;
@@ -5360,7 +5361,13 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 }
 
 /* The counters when a request's decoding began: PROF and DONE report its share. */
-typedef struct { double s_disk, s_attn, s_moe, s_head, t0; } Q36ReqClock;
+typedef struct { double s_disk, s_attn, s_moe, s_head, t0; uint64_t hits, miss; } Q36ReqClock;
+/* the expert cache's hit rate over a request's decoding, for DONE (it said 0.0, and
+ * tools/datapoint.py read a 0% hit rate for every qwen36 run, #2081) */
+static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
+    const double h = (double)(m->hits - c->hits), n = h + (double)(m->miss - c->miss);
+    return n > 0 ? 100.0 * h / n : 0.0;
+}
 
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
@@ -5455,6 +5462,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
+    clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     *ids_out=ids; *np_out=np; *lo_out=lo;
@@ -5520,7 +5528,7 @@ static void serve_one(Model *m, ServeReq *q){
         fflush(stdout);
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
-           dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
+           dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited);
     fflush(stdout);
     {char scope[96]; snprintf(scope, sizeof scope, "turn %s", q->id); q36_spec_report(&spec, scope);}
     q36_spec_free(&spec);
@@ -5917,7 +5925,7 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
         fflush(stdout);
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", r->q.id, r->gen,
-           dt > 0 ? r->gen / dt : 0.0, 0.0, rss_gb(), r->np, r->limited);
+           dt > 0 ? r->gen / dt : 0.0, q36_turn_hit(m, &r->clk), rss_gb(), r->np, r->limited);
     fflush(stdout);
 }
 
@@ -6586,11 +6594,11 @@ int main(int argc, char **argv) {
         /* The rest of the trunk, wherever the placer put it: out_proj,
          * attention projections, shared expert. Handles live in the Layer. */
         {
-            double vram = 0;
-            int placed = trunk_place_dense(&m, &vram);
-            if (placed)
-                fprintf(stderr, "[dense] %d trunk matrices on GPU (dnout/attnproj/shexp, %.2f GB VRAM)\n",
-                        placed, vram / 1073741824.0);
+            double vram = 0; int kinds[3];
+            int placed = trunk_place_dense(&m, &vram, kinds);
+            if (placed)   /* by kind: the shared expert is placed only when offered (#2082) */
+                fprintf(stderr, "[dense] %d trunk matrices on GPU (%d dnout, %d attnproj, %d shexp; %.2f GB VRAM)\n",
+                        placed, kinds[0], kinds[1], kinds[2], vram / 1073741824.0);
         }
         /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
          * both sit on one card, the conv ring, the recurrence and the gated
