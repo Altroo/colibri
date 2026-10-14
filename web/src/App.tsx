@@ -76,7 +76,11 @@ export default function App() {
   const [imageModels, setImageModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
-  const [maxTokens, setMaxTokens] = useState(4096)
+  /* null: the server's own ceiling (/health max_tokens; on colibrì the context the
+     engine holds), sent as no limit at all. A reasoning model's turn is its reasoning
+     plus its answer, and a fixed 4096 cut most of them short (#382). A number: the
+     user's own, up to that ceiling. */
+  const [maxTokens, setMaxTokens] = useState<number | null>(null)
   const [thinking, setThinking] = useState(false)
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
@@ -289,7 +293,7 @@ export default function App() {
         model,
         messages: chatTurns(payload),
         temperature,
-        maxTokens,
+        maxTokens: maxTokens ?? undefined,
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         compact: supportsCompaction(health),
@@ -493,7 +497,7 @@ export default function App() {
             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input id="temperature" className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
-          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
+          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={health?.max_tokens} value={maxTokens ?? health?.max_tokens ?? ""} onChange={(event) => { if (event.target.value === "") { setMaxTokens(null); return } const value = Number(event.target.value); if (!Number.isFinite(value)) return; const wanted = Math.max(1, Math.round(value)); setMaxTokens(health?.max_tokens && wanted >= health.max_tokens ? null : wanted) }} /></label>
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
