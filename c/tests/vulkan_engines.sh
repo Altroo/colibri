@@ -1981,6 +1981,25 @@ EOF
   mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  # the dense part as OLMoE's own bf16 checkpoint has it: every f32 a bf16 widened
+  rm -rf olmoe_tiny_bf16_c && cp -r olmoe_tiny_c olmoe_tiny_bf16_c
+  $PY - <<'EOF'
+import json, struct, numpy as np
+p = "olmoe_tiny_bf16_c/model-00000.safetensors"
+raw = open(p, "rb").read(); n = struct.unpack("<Q", raw[:8])[0]; hdr = json.loads(raw[8:8 + n])
+out, blobs, off = {}, [], 0
+for k, v in hdr.items():
+    if k == "__metadata__": out[k] = v; continue
+    b, dt = raw[8 + n + v["data_offsets"][0]: 8 + n + v["data_offsets"][1]], v["dtype"]
+    if dt == "F32":
+        u = np.frombuffer(b, np.float32).view(np.uint32).astype(np.uint64)
+        b, dt = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), "BF16"
+    out[k] = {"dtype": dt, "shape": v["shape"], "data_offsets": [off, off + len(b)]}
+    blobs.append(b); off += len(b)
+h = json.dumps(out).encode(); h += b" " * (-len(h) % 8)
+with open(p, "wb") as f:
+    f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
+EOF
   inkling_olmoe_tier_fixtures
 }
 
@@ -2079,6 +2098,18 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
   lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  # a bf16 checkpoint's dense matrices go up as bf16 (fmt 11): the CPU's tokens in about
+  # half the device bytes of the f32 snapshot's, with the host copies kept or dropped
+  local mf mb
+  chain_gate olmoe "chain olmoe f32 dense, its bytes" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  mf=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+  chain_gate olmoe "chain olmoe bf16 dense" 1 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
+  mb=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+  $PY -c "import sys; f, b = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if 0 < b < f else 1)" "${mf:-0}" "${mb:-0}" ||
+    fail "chain olmoe bf16 dense: ${mb:-?} MiB resident, not below the f32 snapshot's ${mf:-?} MiB"
+  echo "OK chain olmoe bf16 dense: $mb MiB resident against $mf MiB as f32"
+  chain_gate olmoe "chain olmoe bf16 dense on the device only" 1 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
+  lost_late olmoe "chain olmoe bf16 dense on the device only, device lost mid-decode" 7 redo COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
 
   # serve: a session of pins, prompt-cache extensions, a divergent prompt and logprobs
   # against the CPU's, frame by frame (and with prompts only); the prefix-reuse and

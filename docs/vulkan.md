@@ -2625,6 +2625,22 @@ Resizable BAR**, the case staging is for (none is available); there the copies c
 once per upload and the device then reads VRAM instead of the window or system RAM. The
 contributor who reported the RTX 3070 offered to run it.
 
+## f32 matrices that came from bf16
+
+Several engines keep dense matrices as f32 on the host although the checkpoint stores
+them as bf16: OLMoE's attention, routers and lm_head, Kimi K3's routers and KDA decay
+and beta projections (and its whole trunk at `K3_BITS=32`), Inkling's routers, GLM-5.3's
+f32 trunk. Every such float is a bf16 widened (its low 16 bits are zero), so the device
+copy goes up as bf16 (fmt 11): the same values in half the bytes. On OLMoE-1B-7B the
+dense part takes 0.75 GB instead of 1.5 GB, and the expert tier has the rest. The check is exact and runs once per matrix at
+upload (`coli_vk_f32_fmt`): a matrix with any other float stays f32 (fmt 10). The chain's
+fit, the expert tier's dense budget and the dense-host decision count each matrix at
+the format it will take.
+
+The values are the same, so the tokens are the CPU's; the logits can differ from an
+f32 upload in the last bits, because the shaders sum a bf16 row in steps of 8 rather
+than 4.
+
 ## Dense weights on the device only
 
 Without this mode, an engine whose dense part runs on the device (the chain, or the
