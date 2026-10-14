@@ -2625,20 +2625,23 @@ Resizable BAR**, the case staging is for (none is available); there the copies c
 once per upload and the device then reads VRAM instead of the window or system RAM. The
 contributor who reported the RTX 3070 offered to run it.
 
-## f32 matrices that came from bf16
+## f32 matrices that came from bf16 or f16
 
 Several engines keep dense matrices as f32 on the host although the checkpoint stores
-them as bf16: OLMoE's attention, routers and lm_head, Kimi K3's routers and KDA decay
-and beta projections (and its whole trunk at `K3_BITS=32`), Inkling's routers, GLM-5.3's
-f32 trunk. Every such float is a bf16 widened (its low 16 bits are zero), so the device
-copy goes up as bf16 (fmt 11): the same values in half the bytes. On OLMoE-1B-7B the
-dense part takes 0.75 GB instead of 1.5 GB, and the expert tier has the rest. The check is exact and runs once per matrix at
-upload (`coli_vk_f32_fmt`): a matrix with any other float stays f32 (fmt 10). The chain's
-fit, the expert tier's dense budget and the dense-host decision count each matrix at
-the format it will take.
+them in two bytes a value (bf16, or f16 in some OLMoE releases): OLMoE's attention,
+routers and lm_head, Kimi K3's routers and KDA decay and beta projections (and its whole
+trunk at `K3_BITS=32`), Inkling's routers, GLM-5.3's f32 trunk. Every such float is a
+bf16 or an f16 widened, so the device copy goes up in two bytes a value, as bf16 (fmt 11)
+or f16 (fmt 14): the same values in half the bytes. On OLMoE-1B-7B the dense part takes
+0.75 GB instead of 1.5 GB, and the expert tier has the rest. The check is exact and runs
+once per matrix at upload (`coli_vk_f32_fmt`): bf16 when every float has a zero low half,
+else f16 when an f16 holds every float, else the matrix stays f32 (fmt 10). The chain's
+fit, the expert tier's dense budget and the dense-host decision count each matrix at the
+format it will take, and so does `coli plan`: a BF16 or F16 tensor from the checkpoint's
+header, an F32 one from its values (the one read of tensor values the planner makes).
 
 The values are the same, so the tokens are the CPU's; the logits can differ from an
-f32 upload in the last bits, because the shaders sum a bf16 row in steps of 8 rather
+f32 upload in the last bits, because the shaders sum a 2-byte row in steps of 8 rather
 than 4.
 
 ## Dense weights on the device only

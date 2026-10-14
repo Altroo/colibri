@@ -486,7 +486,7 @@ static void k3_vk_aliases(void){
 }
 /* the backend format of a resident W: int8 rows, int4 groups, f32 */
 static int k3_vk_fmt(const W *w){ return w->fmt==1?1 : w->fmt==4?4 : w->fmt==0?10 : -1; }
-/* the format the device holds w in: an f32 W as bf16 where that holds it exactly */
+/* the format the device holds w in: an f32 W as bf16 or f16 where that holds it exactly */
 static int k3_vk_dev_fmt(const W *w){ return w->fmt==0&&w->f?coli_vk_f32_fmt(w->f,(size_t)w->I*w->O):k3_vk_fmt(w); }
 /* w's device copy into *t on device dev (0 or 1, the second) */
 static int k3_vk_ensure(W *w, ColiVkTensor **t, int dev){
@@ -843,7 +843,7 @@ static void k3_dho_each(Model *m, void (*f)(W *, size_t *, int *), size_t *b, in
     if(m->has_head&&g_k3_dho_head) f(&m->lm_head,b,n);
 }
 static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=x; (*n)++; } }
-/* the same matrices at the bytes the device will hold (an f32 one as bf16 where exact) */
+/* the same matrices at the bytes the device will hold (an f32 one as bf16 or f16 where exact) */
 static void k3_dho_count_dev(W *w, size_t *b, int *n){
     size_t x=k3_w_host_bytes(w);
     if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=w->fmt==0?coli_vk_f32_payload(w->f,w->I,w->O):x; (*n)++; }
@@ -2155,7 +2155,7 @@ static int  k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *s
 static void k3_vk_unhold(void *ctx,void *h);
 static size_t k3_w_bytes(const W *w){
     int fmt=k3_vk_fmt(w);
-    if(fmt==10) return coli_vk_f32_payload(w->f,w->I,w->O);   /* bf16 where exact */
+    if(fmt==10) return coli_vk_f32_payload(w->f,w->I,w->O);   /* bf16 or f16 where exact */
     if(fmt==1)  return (size_t)w->O*w->I+(size_t)w->O*4;
     if(fmt==4)  return (size_t)w->O*((w->I+1)/2)+(size_t)w->O*((w->I+w->gs-1)/w->gs)*4;
     return 0;

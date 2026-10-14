@@ -84,7 +84,7 @@ typedef struct {
 } OlmChain;
 
 
-/* A resident f32 matrix [O x I] on the device (bf16 where that holds it exactly): the
+/* A resident f32 matrix [O x I] on the device (bf16 or f16 where that holds it exactly): the
  * copy the per-matrix path uses (matmul_res), uploaded here if it has not been yet.
  * NULL: refused (it stays so). */
 static ColiVkTensor *olc_tensor(int d, void **vk, const float *w, int I, int O) {
@@ -240,7 +240,7 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows);
 /* In model_init, before olm_dho_start and the tier: the chain decided as olm_dho_start
  * and olc_start decide it (silently: olc_start prints it after the tier), its pipelines
  * up, and N from each layer's bytes (q, k, v, o and the router as the device will hold
- * them, bf16 where exact, the K/V mirror at the split's floor of three blocks, its share
+ * them, bf16 or f16 where exact, the K/V mirror at the split's floor of three blocks, its share
  * of the parameter arena), the fixed bytes (one prompt chunk's scratch from the
  * reservations themselves, its rows' read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
  * it up) the head are marked refused. N = 0: the chain off, its blocks released. Not run

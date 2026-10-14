@@ -123,7 +123,7 @@ static G53Chain *g53c_of(int d) { return d ? g_g53c2 : g_g53c; }
 static const char *g53c_name(const G53Chain *ch) { return ch && ch->d ? "glm53 dev2" : "glm53"; }
 static int g53c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
-/* A Mat's device copy (the per-matrix path's own, where it made one); f32 as bf16 where
+/* A Mat's device copy (the per-matrix path's own, where it made one); f32 as bf16 or f16 where
  * that holds it exactly, else fmt 10. The second device's layers hold theirs there
  * (g_g53c_dev at setup). */
 static ColiVkTensor *g53c_tensor(const Mat *wc) {

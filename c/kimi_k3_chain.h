@@ -332,7 +332,7 @@ static void k3c_fit_f32(const float *w, int I, int O, size_t *b, size_t *mm) {
     *b += vkc_fit_tensor(fmt, I, O, 0); *mm += coli_vk_tensor_payload(fmt, I, O, 0);
 }
 /* What layer i puts on the device, as vkc_fit counts it: its matrices (the router and the
- * KDA decay and beta projections as f32, bf16 where exact), its state at its first size
+ * KDA decay and beta projections as f32, bf16 or f16 where exact), its state at its first size
  * (the KDA state and convolution windows, an MLA layer's mirror at `rows` positions and
  * its rows of the down buffer), its part of the parameters; *mat its matrices' payload. */
 static size_t k3c_layer_bytes(const Model *m, int i, int rows, size_t *mat) {

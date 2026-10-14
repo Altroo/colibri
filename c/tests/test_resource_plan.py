@@ -1968,25 +1968,31 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
                  vk_tensor_bytes(10, 64, 8) - vk_tensor_bytes(11, 64, 8))
         self.assertEqual((got.layers, got.tail), ([168192 - saved] * 4, vk_tensor_bytes(11, 64, 128)))
 
-    def test_bf16_exact_reads_the_dtype_and_the_values(self):
-        from resource_plan import _bf16_exact
-        values = {"exact": struct.pack("<4f", 1.0, -2.5, 0.0, 3.0),
-                  "inexact": struct.pack("<4f", 1.0, -2.5, 0.0, 1.0000001)}
+    def test_half_fmt_reads_the_dtype_and_the_values(self):
+        """backend_vulkan.c coli_vk_f32_fmt's rule from the checkpoint: bf16 (11) when every
+        value is a bf16, f16 (14) when every value is an f16, f32 (None) otherwise; a BF16
+        or F16 tensor from its header, an F32 one from its values."""
+        from resource_plan import _half_fmt
+        values = {"bf16": struct.pack("<4f", 1.0, -2.5, 0.0, 3.0),
+                  "f16": struct.pack("<4f", 1.0, 999 / 1024, 2.0 ** -20, -65504.0),
+                  "f32": struct.pack("<4f", 1.0, -2.5, 0.0, 1.0000001),
+                  "big": struct.pack("<4f", 1.0, 999 / 1024, 0.0, 70000.0)}
         header, blob = {}, b""
         for name, data in values.items():
             header[f"{name}.weight"] = {"dtype": "F32", "shape": [4],
                                         "data_offsets": [len(blob), len(blob) + len(data)]}
             blob += data
-        header["half.weight"] = {"dtype": "BF16", "shape": [4], "data_offsets": [len(blob), len(blob) + 8]}
-        blob += b"\1" * 8
+        for name, dtype in (("half", "BF16"), ("fp16", "F16"), ("fp8", "F8_E4M3")):
+            header[f"{name}.weight"] = {"dtype": dtype, "shape": [4], "data_offsets": [len(blob), len(blob) + 8]}
+            blob += b"\1" * 8
         raw = json.dumps(header).encode()
         (self.model / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + blob)
         info = {"path": str(self.model),
                 "dense_tensors": [{"name": n, "dtype": h["dtype"]} for n, h in header.items()]}
-        self.assertTrue(_bf16_exact(info, "exact.weight"))
-        self.assertFalse(_bf16_exact(info, "inexact.weight"))
-        self.assertTrue(_bf16_exact(info, "half.weight"))      # from its header alone
-        self.assertFalse(_bf16_exact(info, "missing.weight"))
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("bf16", "f16", "f32", "big")],
+                         [11, 14, None, None])
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("half", "fp16", "fp8", "missing")],
+                         [11, 14, None, None])   # from the header alone
 
     def test_layouts_are_the_engines(self):
         # "[VK] qwen36 chain fit: ... fixed X B (the engine's E B, ...), tail T B, layers ..." and

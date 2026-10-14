@@ -2,8 +2,9 @@
  * decode and prefill, and reserve their bytes before sizing the expert tier.
  * A numerical comparison alone would pass when every call falls back to CPU.
  * An f32 matrix whose floats are all bf16 widened (a bf16 checkpoint read into
- * f32) goes up as fmt 11, in half the bytes, and the budget counts it so; any
- * other stays fmt 10. */
+ * f32) goes up as fmt 11, one whose floats are all f16 (an f16 checkpoint) as
+ * fmt 14, each in half the bytes, and the budget counts it so; any other stays
+ * fmt 10. */
 #define main glm53_main_unused
 #include "../glm53.c"
 #undef main
@@ -19,7 +20,7 @@ static int run_case(const char *name, float *weights, int want_fmt, const float 
         return 1;
     }
     if (glm53_mat_dev_bytes(&w) != coli_vk_tensor_payload(want_fmt, I, O, 0) ||
-        glm53_mat_dev_bytes(&w) < (size_t)I * O * (want_fmt == 11 ? 2 : 4)) {
+        glm53_mat_dev_bytes(&w) < (size_t)I * O * (want_fmt == 10 ? 4 : 2)) {
         fprintf(stderr, "FAIL: %s residents counted at %zu bytes in the dense GPU budget\n", name, glm53_mat_dev_bytes(&w));
         return 1;
     }
@@ -82,8 +83,10 @@ static int run_case(const char *name, float *weights, int want_fmt, const float 
 }
 
 int main(void) {
-    static float f32[I * O], bf16[I * O], x[S * I];
+    static float f32[I * O], bf16[I * O], f16[I * O], x[S * I];
     for (int i = 0; i < I * O; i++) f32[i] = (float)(i % 19 - 9) / 19.f;
+    /* ten bits after the point: every one an f16, 999/1024 and others no bf16 */
+    for (int i = 0; i < I * O; i++) f16[i] = (float)((i * 37) % 2001 - 1000) / 1024.f;
     for (int i = 0; i < I * O; i++) {   /* the same values cut to bf16, as a bf16 checkpoint gives them */
         uint32_t u; memcpy(&u, &f32[i], 4); u &= 0xffff0000u; memcpy(&bf16[i], &u, 4);
     }
@@ -94,7 +97,8 @@ int main(void) {
     }
     int failed = run_case("f32", f32, 10, x);
     failed |= run_case("bf16-exact", bf16, 11, x);
+    failed |= run_case("f16-exact", f16, 14, x);
     coli_vk_shutdown();
-    if (!failed) puts("PASS: glm53 f32 Vulkan decode, prefill and dense budget (fmt 10, and fmt 11 where exact)");
+    if (!failed) puts("PASS: glm53 f32 Vulkan decode, prefill and dense budget (fmt 10, and fmt 11 or 14 where exact)");
     return failed;
 }

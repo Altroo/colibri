@@ -225,11 +225,13 @@ size_t coli_vk_tensor_row_bytes(int fmt, int I);
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs);
-/* An f32 matrix [O x I] on the device as bf16 (fmt 11) when that holds it exactly (every
- * float a bf16 widened, as a bf16 checkpoint read into f32 gives), as f32 (fmt 10)
- * otherwise. coli_vk_f32_fmt is the format it takes, coli_vk_f32_payload its bytes (fmt
- * 10's without w). ensure_f32: an existing tensor is fine at either format; dev2 = on
- * the second device. matmul_f32: coli_vk_matmul for such a matrix, w NULL once it is up. */
+/* An f32 matrix [O x I] on the device in 2 bytes a value when that holds it exactly: bf16
+ * (fmt 11) when every float is a bf16 widened, as a bf16 checkpoint read into f32 gives;
+ * f16 (fmt 14) when every float is one an f16 holds, as an f16 checkpoint gives; f32
+ * (fmt 10) otherwise. coli_vk_f32_fmt is the format it takes, coli_vk_f32_payload its
+ * bytes (fmt 10's without w). ensure_f32: an existing tensor is fine at any of the three;
+ * dev2 = on the second device. matmul_f32: coli_vk_matmul for such a matrix, w NULL once
+ * it is up. */
 int    coli_vk_f32_fmt(const float *w, size_t n);
 size_t coli_vk_f32_payload(const float *w, int I, int O);
 int    coli_vk_tensor_ensure_f32(ColiVkTensor **tensor, const float *w, int I, int O, int dev2);

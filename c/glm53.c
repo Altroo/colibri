@@ -1008,14 +1008,15 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
  * matrix is uploaded once the device is open and its host copy is given back, before the
  * expert cache sizes itself from the free memory (expert_cache_init), so that RAM goes to
  * the experts. mv and mm multiply a matrix the device holds alone by that copy (f32 as
- * bf16 where that holds it exactly, else fmt 10, as the chain uploads it); anything else that reads it (mv_rows,
- * mm_rows, a parallel region, a lost device) reads it back from the checkpoint first:
+ * bf16 or f16 where that holds it exactly, else fmt 10, as the chain uploads it);
+ * anything else that reads it (mv_rows, mm_rows, a parallel region, a lost device) reads
+ * it back from the checkpoint first:
  * load_mat, or absorb_kvb for kv_b's two halves, with the GLM53_BITS of the load, so the
  * same bytes; the copy stays from there on. */
 static GModel *g_g53_dho_model;
 static pthread_mutex_t g_g53_dho_mx = PTHREAD_MUTEX_INITIALIZER;
 /* y = x W^T for S rows on the device by w's copy, uploaded first if it is not up (f32 as
- * coli_vk_matmul_f32 holds it: bf16 where exact); 0 = the CPU computes. */
+ * coli_vk_matmul_f32 holds it: bf16 or f16 where exact); 0 = the CPU computes. */
 static int g53_vk_matmul(const Mat *wc, float *out, const float *x, int S) {
     Mat *w = (Mat *)wc;
     if (w->fmt == 0) return coli_vk_matmul_f32((ColiVkTensor **)&w->vk, out, x, w->f, S, w->columns, w->rows);
@@ -5147,7 +5148,7 @@ static int glm53_in_ram(void *ctx, int layer, int eid) {
 static size_t glm53_mat_dev_bytes(const Mat *w) {
     if (!w->resident || (w->fmt != 0 && w->fmt != 1 && w->fmt != 4) || w->rows < 1 || w->columns < 1) return 0;
     const size_t r = (size_t)w->rows, cl = (size_t)w->columns;
-    if (w->fmt == 0) return coli_vk_f32_payload(w->f, w->columns, w->rows);   /* bf16 where exact */
+    if (w->fmt == 0) return coli_vk_f32_payload(w->f, w->columns, w->rows);   /* bf16 or f16 where exact */
     return w->fmt == 1 ? r * cl + r * 4 : r * ((cl + 1) / 2) + r * ((cl + w->gs - 1) / w->gs) * 4;
 }
 static size_t glm53_dense_dev_bytes(const GModel *m) {

@@ -224,7 +224,8 @@ static int inkc_place_layer(Model *m, InkChain *ch, int i, const char **what) {
         if (!(ch->t_dg[i] = inkc_tensor(d, l->dg, D, c->dense_inter)) || !(ch->t_du[i] = inkc_tensor(d, l->du, D, c->dense_inter)) ||
             !(ch->t_dd[i] = inkc_tensor(d, l->dd, c->dense_inter, D))) *what = "a dense MLP matrix";
     } else {
-        if (!coli_vk_tensor_ensure_f32(&ch->t_router[i], l->router, D, E + ns, d)) *what = "the router";   /* bf16 where exact */
+        /* the router's f32: bf16 or f16 where exact */
+        if (!coli_vk_tensor_ensure_f32(&ch->t_router[i], l->router, D, E + ns, d)) *what = "the router";
         for (int j = 0; j < ns && !*what; j++)
             if (!(ch->t_sg[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_g, (int64_t)j * I * D, D), D, I)) ||
                 !(ch->t_su[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_u, (int64_t)j * I * D, D), D, I)) ||

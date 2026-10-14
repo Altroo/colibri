@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -391,7 +392,7 @@ def _vk_up(value, align=_VK_ALIGN):
     return (value + align - 1) // align * align
 
 
-_BF16_EXACT = {}
+_HALF_FMT = {}
 _SHARD_INDEX = {}
 
 
@@ -424,48 +425,66 @@ def _shard_index(model_dir):
     return _SHARD_INDEX[key]
 
 
-def _bf16_exact(info, name):
-    """Whether every value of checkpoint tensor `name`, read into f32, is a bf16 widened:
-    the test backend_vulkan.c's coli_vk_f32_fmt makes before an engine uploads an f32
-    matrix (bf16, fmt 11, when it holds; f32, fmt 10, otherwise). A BF16 tensor always
-    is, from its header; an F32 one when the low half of every float is zero, read from
-    its shard once (up to the first float that is not); any other dtype (F16, FP8 with its
-    scales, a quantized container) is taken as not. The one read of tensor values the
-    planner makes, and only for F32 matrices: the checkpoints themselves are BF16."""
+def _f32_is_f16(u):
+    """f32 bits an f16 holds exactly (backend_vulkan.c f32_is_f16)."""
+    a, e = u & 0x7FFFFFFF, ((u >> 23) & 0xFF) - 127
+    m = a & 0x7FFFFF
+    if not a:
+        return True
+    if e == 128:
+        return not m & 0x1FFF
+    if e > 15 or e < -24:
+        return False
+    if e >= -14:
+        return not m & 0x1FFF
+    return not (m | 0x800000) & ((1 << (-1 - e)) - 1)
+
+
+def _half_fmt(info, name):
+    """The 2-byte format an engine uploads its f32 copy of checkpoint tensor `name` in, or
+    None when it stays f32: the test backend_vulkan.c's coli_vk_f32_fmt makes, bf16 (fmt
+    11) when every value is a bf16 widened, f16 (fmt 14) when every value is one an f16
+    holds. A BF16 tensor is the first and an F16 one the second, from the header; an F32
+    one is read from its shard once (up to the first value that rules both out); any
+    other dtype (FP8 with its scales, a quantized container) is taken as neither. The one
+    read of tensor values the planner makes, and only for F32 matrices: the checkpoints
+    themselves are BF16 or F16."""
     tensor = next((t for t in info.get("dense_tensors", []) if _text_weight_name(t["name"]) == name), None)
     if tensor is None:
-        return False
-    if tensor["dtype"] == "BF16":
-        return True
+        return None
+    if tensor["dtype"] in ("BF16", "F16"):
+        return 11 if tensor["dtype"] == "BF16" else 14
     if tensor["dtype"] != "F32" or not info.get("path"):
-        return False
+        return None
     key = (_shard_key(info["path"]), tensor["name"])
-    if key not in _BF16_EXACT:
+    if key not in _HALF_FMT:
         where = _shard_index(info["path"]).get(tensor["name"])
-        exact = where is not None and (where[2] - where[1]) % 4 == 0
-        if exact:
+        bf16 = f16 = where is not None and (where[2] - where[1]) % 4 == 0
+        if bf16:
             try:
                 with where[0].open("rb") as stream:
                     stream.seek(where[1])
                     left = where[2] - where[1]
-                    while left and exact:
+                    while left and (bf16 or f16):
                         data = stream.read(min(left, 1 << 24))
                         if not data:
-                            exact = False
+                            bf16 = f16 = False
                             break
                         words = len(data) // 4
                         # little-endian floats: bytes 0 and 1 of every word are its low half
-                        exact = data[0::4].count(0) == words and data[1::4].count(0) == words
+                        bf16 = bf16 and data[0::4].count(0) == words and data[1::4].count(0) == words
+                        if f16:
+                            f16 = all(_f32_is_f16(u) for u in struct.unpack(f"<{words}I", data))
                         left -= len(data)
             except OSError:
-                exact = False
-        _BF16_EXACT[key] = exact
-    return _BF16_EXACT[key]
+                bf16 = f16 = False
+        _HALF_FMT[key] = 11 if bf16 else 14 if f16 else None
+    return _HALF_FMT[key]
 
 
 def _f32_vk_fmt(info, name):
     """The format an engine uploads its f32 copy of checkpoint tensor `name` in."""
-    return 11 if name and _bf16_exact(info, name) else 10
+    return (_half_fmt(info, name) if name else None) or 10
 
 
 def vk_tensor_bytes(fmt, columns, rows, group=0):
@@ -804,7 +823,7 @@ _VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
 
 def _olmoe_chain_layout(info, env, vulkan):
     """olmoe_chain.h olc_fit_start: q, k, v, o and the router as the engine uploads its f32
-    copies (bf16 where exact, _f32_vk_fmt), the K/V mirror at the split's floor, the
+    copies (bf16 or f16 where exact, _f32_vk_fmt), the K/V mirror at the split's floor, the
     parameters; one chunk's scratch; lm_head the tail."""
     c = info.get("config") or {}
     try:
@@ -969,7 +988,7 @@ _VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
 
 def _glm53_chain_layout(info, env, vulkan):
     """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
-    matrices at GLM53_BITS as quantize_loaded leaves them (32: f32, uploaded as bf16 where
+    matrices at GLM53_BITS as quantize_loaded leaves them (32: f32, uploaded as bf16 or f16 where
     exact, _f32_vk_fmt), an int4 container's as it is,
     the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
     window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
@@ -1206,7 +1225,7 @@ def _k3_chain_layout(info, env, vulkan):
 
     def w(name, out, columns, b):
         fmt, group = _k3_vk_fmt(tensors, name, out, columns, b, explicit)
-        if fmt == 10:   # an f32 W goes up as bf16 where exact (k3_vk_ensure)
+        if fmt == 10:   # an f32 W goes up as bf16 or f16 where exact (k3_vk_ensure)
             fmt = _f32_vk_fmt(info, name)
         return vk_tensor_bytes(fmt, columns, out, group)
     rows = _vk_rows(env, 256)
