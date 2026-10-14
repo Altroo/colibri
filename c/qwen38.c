@@ -2917,7 +2917,7 @@ static void q38_vk_tier_start(Model *m,int cap){
             }
         }
         vkt_put_done();
-        fprintf(stderr,"[VK] tier qwen38: warm start, %d experts from the history in %.1fs\n",n,now_s()-t0);
+        vkt_warm_report("qwen38", n, now_s() - t0);
     }
     free(pl);free(pe);
 }
