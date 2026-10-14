@@ -53,10 +53,10 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
 enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
@@ -99,6 +99,7 @@ typedef struct {
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
+    VkShaderModule mod_moe; VkPipeline moe;                   /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress) */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -409,6 +410,20 @@ int vkc_init(void) {
                     fprintf(stderr, "[VK] chain: chain_gemv2 stages x in %d KiB of shared memory, the device's limit\n", xs / 64);
             }
         }
+    }
+    /* the routed experts by address (chain_moe.comp): a device with bufferDeviceAddress
+     * and clustered subgroup adds; the input rows staged in what shared memory allows */
+    VkPhysicalDeviceSubgroupProperties msg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &msg};
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &mp2);
+    if (KC.core.bda && (msg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) &&
+        (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) {
+        int32_t xs = (int32_t)(kc_shared_limit() / 4) & ~3;
+        if (xs > 8192) xs = 8192;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &xs};
+        if (xs >= 1024) KC.moe = make_pipe(KC.mod_moe, &si);
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -1260,7 +1275,7 @@ int vkc_route_ready(void) { return vkc_ready() && KC.mpipe[PM_ROUTE]; }
 int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p) {
     KC.kind = PK_ROUTE;
     if (!KC.mpipe[PM_ROUTE] || p->S < 1 || p->E < 1 || p->E > VKC_ROUTE_EMAX || p->K < 1 || p->K > VKC_ROUTE_KMAX ||
-        p->K > p->E || p->kind < 0 || p->kind > 2 || (p->has_bias && !bias) || !(p->temp > 0.0f) ||
+        p->K > p->E || p->kind < 0 || p->kind > 2 || p->has_bias < 0 || p->has_bias > 2 || (p->has_bias && !bias) || !(p->temp > 0.0f) ||
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group)))
         return 0;
     /* without a bias the logits stand in for it, at their own offset: a device that reads
@@ -1270,6 +1285,32 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
     VkcBind bd[4] = {B(logits, 0), B(q.has_bias ? bias : logits, 0), B(ids, 1), B(w, 1)};
     uint32_t gx, gy; grid((uint64_t)q.S, &gx, &gy);
     return record(KC.mpipe[PM_ROUTE], bd, 4, &q, sizeof q, gx, gy, 1);
+}
+/* the routed experts (chain_moe.comp): gate and up of every (row, slot), then down and
+ * the weighted sum of each row's slots */
+int vkc_moe_ready(void) { return vkc_ready() && KC.moe; }
+int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
+    KC.kind = PK_MOE;
+    if (!KC.moe || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
+        (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
+        hid == x || hid == y || y == x) return 0;
+    if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
+    struct { int mode, S, K, D, I, act; float limit, a, b;
+             int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw; } pc =
+        {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b,
+         p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row, 64};
+    /* gate and up, then down, each (pair, 64 outputs) a workgroup; then the rank-order sum */
+    VkcBind bd[6] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0)};
+    uint32_t gx, gy;
+    grid((uint64_t)p->S * p->K * ((p->I + 63) / 64), &gx, &gy);
+    if (!record(KC.moe, bd, 6, &pc, sizeof pc, gx, gy, 1)) return 0;
+    pc.mode = 1;
+    grid((uint64_t)p->S * p->K * ((p->D + 63) / 64), &gx, &gy);
+    if (!record(KC.moe, bd, 6, &pc, sizeof pc, gx, gy, 1)) return 0;
+    pc.mode = 2;
+    VkcBind bd2[6] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1)};
+    grid((uint64_t)p->S * ((p->D + 255) / 256), &gx, &gy);
+    return record(KC.moe, bd2, 6, &pc, sizeof pc, gx, gy, 1);
 }
 int vkc_ares_ready(void) { return vkc_ready() && KC.mpipe[PM_ARES]; }
 int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
@@ -1868,6 +1909,8 @@ void vkc_shutdown(void) {
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
+    if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
+    if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
     for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);

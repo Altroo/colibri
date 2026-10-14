@@ -1467,16 +1467,17 @@ static void test_situ(float b1, float b2) {
  * norm from K > 1 with 1e-20). The ids exactly, the weights to 1e-5. */
 static void route_ref(const float *lg, const float *bias, int E, int K, int kind, int has_bias, int ng, int tg, int norm,
                       float temp, float scale, float eps, int *ids, float *w) {
-    float sc[1024], pk[1024];
+    float sc[1024], pk[1024], lb[1024];
+    for (int e = 0; e < E; e++) lb[e] = (lg[e] + (has_bias == 2 ? bias[e] : 0.f)) / temp;
     if (kind == 0) {
-        float m = -1e30f; for (int e = 0; e < E; e++) if (lg[e] / temp > m) m = lg[e] / temp;
-        float s = 0; for (int e = 0; e < E; e++) { sc[e] = expf(lg[e] / temp - m); s += sc[e]; }
+        float m = -1e30f; for (int e = 0; e < E; e++) if (lb[e] > m) m = lb[e];
+        float s = 0; for (int e = 0; e < E; e++) { sc[e] = expf(lb[e] - m); s += sc[e]; }
         for (int e = 0; e < E; e++) sc[e] /= s;
     } else for (int e = 0; e < E; e++) {
-        float v = lg[e] / temp;
+        float v = lb[e];
         sc[e] = kind == 1 ? sigm(v) : sqrtf(v > 20.0f ? v : logf(1.0f + expf(v)));
     }
-    for (int e = 0; e < E; e++) pk[e] = sc[e] + (has_bias ? bias[e] : 0.f);
+    for (int e = 0; e < E; e++) pk[e] = sc[e] + (has_bias == 1 ? bias[e] : 0.f);
     unsigned char keep[1024]; memset(keep, 1, sizeof keep);
     if (ng > 1) {
         int per = E / ng; float gs[64]; unsigned char gk[64] = {0};
@@ -1528,6 +1529,128 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
     if (getenv("VKC_TEST_VERBOSE")) printf("route %s: weights %.2e\n", what, worst);
     vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
     free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
+}
+
+/* ---- the routed experts (chain_moe.comp) ------------------------------------------------ */
+/* weight (o, i) of an [O x I] matrix in the tier's layout, as qmatmul.comp reads it */
+static float moe_e4m3(unsigned b) {
+    if ((b & 0x7fu) == 0x7fu) return NAN;
+    unsigned e = (b >> 3) & 15u, m = b & 7u;
+    float v = e == 0 ? (float)m * 0.001953125f : ldexpf(1.f + (float)m * 0.125f, (int)e - 7);
+    return (b & 0x80u) ? -v : v;
+}
+static float moe_w(int fmt, const uint8_t *row, const float *sc, int o, int i, int I, int gs) {
+    static const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    int ng = gs > 0 ? (I + gs - 1) / gs : 0, nib = (row[i / 2] >> (4 * (i & 1))) & 15;
+    float f; uint32_t u;
+    switch (fmt) {
+    case 1:  return (float)(int8_t)row[i] * sc[o];
+    case 2:  return (float)(nib - 8) * sc[o];
+    case 4:  return (float)(nib - 8) * sc[(size_t)o * ng + i / gs];
+    case 7:  return ((nib & 8) ? -lut[nib & 7] : lut[nib & 7]) * sc[(size_t)o * ng + i / gs];
+    case 12: return moe_e4m3(row[i]) * sc[(size_t)o * ng + i / gs];
+    case 13: return (float)(int8_t)row[i] * sc[(size_t)o * ng + i / gs];
+    case 10: memcpy(&f, row + 4 * i, 4); return f;
+    case 11: u = (uint32_t)(row[2 * i] | row[2 * i + 1] << 8) << 16; memcpy(&f, &u, 4); return f;
+    case 5: {   /* int3-g64: per 64 inputs 16 bytes of 2-bit lows, 8 of high bits, v + 4 */
+        int g = i / 64, j = i % 64;
+        const uint8_t *b = row + (size_t)g * 24;
+        int v = ((b[j / 4] >> (2 * (j % 4))) & 3) | (((b[16 + j / 8] >> (j % 8)) & 1) << 2);
+        return (float)(v - 4) * sc[(size_t)o * ((I + 63) / 64) + g];
+    }
+    }
+    return 0.f;
+}
+typedef struct { ColiVkTensor *t; uint8_t *rows; float *sc; int fmt, I, O, gs; size_t rb; } MoeMat;
+/* a matrix in the tier's pool with random codes, and the host's copy for the reference */
+static int moe_mat(MoeMat *m, int fmt, int I, int O, int gs) {
+    memset(m, 0, sizeof *m);
+    m->fmt = fmt; m->I = I; m->O = O; m->gs = (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) ? gs : 0;
+    uint8_t *rows; size_t stride; float *scales;
+    if (!coli_vk_tier_tensor(&m->t, fmt, I, O, m->gs, &rows, &stride, &scales)) return 0;
+    m->rb = coli_vk_tensor_row_bytes(fmt, I);
+    size_t ns = coli_vk_tensor_scale_count(fmt, I, O, m->gs);
+    m->rows = malloc(m->rb * (size_t)O); m->sc = malloc(ns * sizeof(float));
+    for (size_t b = 0; b < m->rb * (size_t)O; b++) {
+        uint8_t v = (uint8_t)rnd();
+        if (fmt == 12 && (v & 0x7f) == 0x7f) v = 0x38;   /* no NaN codes */
+        m->rows[b] = v;
+    }
+    if (fmt == 10) for (size_t i = 0; i < (size_t)I * O; i++) { float f = frnd() * 0.1f; memcpy(m->rows + 4 * i, &f, 4); }
+    if (fmt == 11) for (size_t i = 0; i < (size_t)I * O; i++) { float f = frnd() * 0.1f; uint32_t u; memcpy(&u, &f, 4);
+                                                             m->rows[2 * i] = (uint8_t)(u >> 16); m->rows[2 * i + 1] = (uint8_t)(u >> 24); }
+    if (fmt == 5) {   /* int3's row padding past I stays out of the reference (rows hold whole groups) */ }
+    for (size_t k = 0; k < ns; k++) m->sc[k] = (fmt == 10 || fmt == 11) ? 1.f : (0.5f + 0.5f * frnd()) * (fmt == 1 || fmt == 13 ? 0.002f : 0.02f);
+    for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, m->rows + (size_t)o * m->rb, m->rb);
+    memcpy(scales, m->sc, ns * sizeof(float));
+    return coli_vk_tensor_commit(&m->t, 1);
+}
+static void moe_mv(float *y, const MoeMat *m, const float *x) {
+    for (int o = 0; o < m->O; o++) {
+        double a = 0; const uint8_t *row = m->rows + (size_t)o * m->rb;
+        for (int i = 0; i < m->I; i++) a += (double)x[i] * moe_w(m->fmt, row, m->sc, o, i, m->I, m->gs);
+        y[o] = (float)a;
+    }
+}
+/* E experts of gate/up format fg and down format fd (gs for the grouped ones), one of
+ * them not resident (a zero entry); the device routes S rows (softmax, top K, normalized)
+ * and computes the layer, the table's entries from t_off on */
+static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg, int fd, int gs, int act, float limit) {
+    const float a = 2.5f, b = 7.f;
+    MoeMat *g = calloc((size_t)E, sizeof *g), *u = calloc((size_t)E, sizeof *u), *d = calloc((size_t)E, sizeof *d);
+    ColiVkExpert **ex = calloc((size_t)E, sizeof *ex);
+    int t_off = 3, gone = E / 2, ok = 1;
+    uint32_t *tab = calloc((size_t)(t_off + E) * COLI_VK_XB_ENTRY, 4);
+    for (int e = 0; e < E && ok; e++) {
+        ok = moe_mat(&g[e], fg, D, I, gs) && moe_mat(&u[e], fg, D, I, gs) && moe_mat(&d[e], fd, I, D, gs) &&
+             (ex[e] = coli_vk_xb_expert(g[e].t, u[e].t, d[e].t)) != NULL;
+        if (ok && e != gone) ok = coli_vk_xb_expert_entry(ex[e], tab + (size_t)(t_off + e) * COLI_VK_XB_ENTRY);
+    }
+    if (!ok) { fails++; printf("FAIL: moe %s: the experts did not go up\n", what); return; }
+    int lrow = E + 2, xrow = D + 3, irow = K + 1, wrow = K + 2, yrow = D + 1;
+    float *lg = fvec((size_t)S * lrow, 3.f), *x = fvec((size_t)S * xrow, 1.f), *ref = calloc((size_t)S * yrow, 4);
+    int *rid = malloc((size_t)S * K * sizeof(int)); float *rw = malloc((size_t)S * K * sizeof(float));
+    float *gv = malloc((size_t)I * 4), *uv = malloc((size_t)I * 4), *hv = malloc((size_t)I * 4), *yv = malloc((size_t)D * 4);
+    for (int s = 0; s < S; s++) {
+        route_ref(lg + (size_t)s * lrow, NULL, E, K, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, rid + s * K, rw + s * K);
+        for (int k = 0; k < K; k++) {
+            int e = rid[s * K + k];
+            if (e < 0 || e == gone) continue;
+            const float *xs = x + (size_t)s * xrow + 2;
+            moe_mv(gv, &g[e], xs); moe_mv(uv, &u[e], xs);
+            for (int i = 0; i < I; i++) {
+                float gg = gv[i], uu = uv[i];
+                if (act == 1) hv[i] = a * tanhf(gg / a) * sigm(gg) * (b * tanhf(uu / b));
+                else {
+                    if (limit > 0) { if (gg > limit) gg = limit; if (uu > limit) uu = limit; if (uu < -limit) uu = -limit; }
+                    hv[i] = gg / (1.f + expf(-gg)) * uu;
+                }
+            }
+            moe_mv(yv, &d[e], hv);
+            for (int o = 0; o < D; o++) ref[(size_t)s * yrow + 1 + o] += rw[s * K + k] * yv[o];
+        }
+    }
+    VkcBuf *lb = up(lg, (size_t)S * lrow), *xb = up(x, (size_t)S * xrow);
+    VkcBuf *tb = vkc_buf((size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+    VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
+    VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
+    VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
+    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow};
+    int rec = vkc_begin() && vkc_write(tb, 0, tab, (size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4) &&
+              vkc_route(lb, NULL, ib, wb, &rp) && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+    float *got = down(yb, 0, (size_t)S * yrow);
+    double e = 0;
+    for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e) e = r; }
+    CHECK(rec && e < 2e-4 && !bad(got, (size_t)S * yrow), "moe %s (fmt %d/%d, D %d I %d E %d S %d K %d act %d): rel err %.2e",
+          what, fg, fd, D, I, E, S, K, act, e);
+    if (getenv("VKC_TEST_VERBOSE")) printf("moe %s: %.2e\n", what, e);
+    vkc_free(lb); vkc_free(xb); vkc_free(tb); vkc_free(ib); vkc_free(wb); vkc_free(hb); vkc_free(yb);
+    for (int k = 0; k < E; k++) {
+        if (ex[k]) coli_vk_xb_expert_free(ex[k]);
+        free(g[k].rows); free(g[k].sc); free(u[k].rows); free(u[k].sc); free(d[k].rows); free(d[k].sc);
+    }
+    free(g); free(u); free(d); free(ex); free(tab); free(lg); free(x); free(ref); free(rid); free(rw);
+    free(gv); free(uv); free(hv); free(yv); free(got);
 }
 
 /* ---- DeepSeek V4.1 / V4 attention (chain_dsv4.comp) ------------------------------------- */
@@ -2795,11 +2918,15 @@ int main(int argc, char **argv) {
         test_situ(1.f, 1.f); test_situ(4.f, 25.f);
         printf("ares done\n");
     }
+    /* the router's and the experts' cases draw their own numbers: the cases after them
+     * see the same data with or without them */
+    unsigned rng_routed = rng;
     if (!vkc_route_ready()) { fails++; printf("FAIL: the route shader did not load\n"); }
     else {
         test_route("olmoe softmax", 5, 64, 8, 0, 0, 1, 1, 0, 1.f, 1.f, 0.f, 0);
         test_route("qwen36 softmax, norm", 7, 256, 8, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
         test_route("qwen36 group-limited", 3, 128, 8, 0, 0, 8, 4, 1, 1.f, 1.f, 0.f, 0);
+        test_route("qwen36 gate bias in the logits", 3, 128, 8, 0, 2, 1, 1, 1, 1.f, 1.f, 0.f, 0);
         test_route("glm53 sigmoid, bias, scale", 4, 256, 8, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
         test_route("kimi sigmoid top-16 of 896", 3, 896, 16, 1, 1, 1, 1, 1, 1.f, 2.827f, 0.f, 0);
         test_route("deepseek sqrt(softplus)", 5, 256, 6, 2, 1, 1, 1, 2, 1.3f, 1.5f, 1e-20f, 0);
@@ -2810,6 +2937,26 @@ int main(int argc, char **argv) {
         test_route("ties: the lower expert", 2, 64, 4, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 1);
         printf("route done\n");
     }
+    if (!vkc_moe_ready()) printf("moe: no bufferDeviceAddress on this device, the routed experts stay on the host\n");
+    /* D = 256: gate and up's rows are whole 16-byte steps in every format but int3 (the
+     * 16-byte way); I = 88: down's int8 and int4 rows are not (the 32-bit way) */
+    else if (!coli_vk_xb_init(256, 88, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { fails++; printf("FAIL: moe: the expert batch did not start\n"); }
+    else {
+        coli_vk_tier_pool_limit((size_t)256 << 20);
+        int pairs[][2] = {{1, 1}, {2, 2}, {4, 4}, {5, 5}, {7, 7}, {10, 10}, {11, 11}, {12, 12}, {13, 13}, {4, 1}};
+        for (size_t k = 0; k < sizeof pairs / sizeof *pairs; k++) {
+            char nm[32]; snprintf(nm, sizeof nm, "fmt %d/%d", pairs[k][0], pairs[k][1]);
+            test_moe(nm, 256, 88, 6, 2, 3, pairs[k][0], pairs[k][1], 32, 0, 0.f);
+        }
+        /* groups smaller than a 16-byte step: a scale a word */
+        test_moe("int4 in groups of 8", 256, 88, 6, 2, 3, 4, 4, 8, 0, 0.f);
+        test_moe("int8 in groups of 4", 256, 88, 6, 2, 3, 13, 13, 4, 0, 0.f);
+        test_moe("SwiGLU clamped", 256, 88, 6, 3, 2, 4, 4, 32, 0, 0.05f);
+        test_moe("SiTU-GLU", 256, 88, 6, 1, 4, 1, 1, 32, 1, 0.f);
+        test_moe("top-1, three rows", 256, 88, 8, 3, 1, 2, 2, 32, 0, 0.f);
+        printf("moe done\n");
+    }
+    rng = rng_routed;
     if (vkc_sconv_ready() && vkc_relattn_ready()) {
         test_inkling();
         VkcStats s0; vkc_stats(&s0);

@@ -1,11 +1,11 @@
 #version 450
 // The router's pick on the dense chain (vk_chain.c, chain_route; vk_chain.h: vkc_route),
 // every MoE engine's kind of it: one workgroup per row s < S, E <= 1024 experts, K <= 32.
-//   logit e:  l[l_off + s*l_row + e] / temp
+//   logit e:  (l[l_off + s*l_row + e], plus bias[b_off + e] with has_bias 2) / temp
 //   score:    kind 0 softmax over the row (max, exp(l - max), sum, divide: the CPU's
 //             softmax_row), 1 sigmoid, 2 sqrt(softplus) (softplus = l above 20, else
 //             log(1 + exp(l)): deepseek_v41.c moe_gate)
-//   pick:     the score, plus bias[b_off + e] with has_bias (the bias picks; the weight
+//   pick:     the score, plus bias[b_off + e] with has_bias 1 (the bias picks; the weight
 //             stays the score: noaux_tc)
 //   groups:   n_group > 1: E / n_group experts a group, a group's value the sum of its two
 //             best picks, the topk_group best groups kept (the lower group on a tie) and
@@ -50,6 +50,12 @@ shared float wv[32];
 // index is read with every lane active, clamped as well.
 #define A(i) min(i, 1023)
 
+float logit(int lb, int e) {
+    float v = l[lb + e];
+    if (p.has_bias == 2) v += bias[p.b_off + e];
+    return v / p.temp;
+}
+
 void main() {
     int s = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
     if (s >= p.S) return;                          // uniform across the workgroup
@@ -59,14 +65,14 @@ void main() {
     // scores
     if (p.kind == 0) {
         float m = NEG;
-        for (int e = tid; e < p.E; e += 256) m = max(m, l[lb + e] / p.temp);
+        for (int e = tid; e < p.E; e += 256) m = max(m, logit(lb, e));
         rv[tid] = m;
         barrier();
         for (int off = 128; off > 0; off >>= 1) { if (tid < off) rv[tid] = max(rv[tid], rv[tid + off]); barrier(); }
         float mx = rv[0];
         barrier();
         float acc = 0.0;
-        for (int e = tid; e < p.E; e += 256) { float v = exp(l[lb + e] / p.temp - mx); sc[e] = v; acc += v; }
+        for (int e = tid; e < p.E; e += 256) { float v = exp(logit(lb, e) - mx); sc[e] = v; acc += v; }
         rv[tid] = acc;
         barrier();
         for (int off = 128; off > 0; off >>= 1) { if (tid < off) rv[tid] += rv[tid + off]; barrier(); }
@@ -75,14 +81,14 @@ void main() {
         for (int e = tid; e < p.E; e += 256) sc[e] = sc[A(e)] / sum;
     } else {
         for (int e = tid; e < p.E; e += 256) {
-            float v = l[lb + e] / p.temp;
+            float v = logit(lb, e);
             sc[e] = p.kind == 1 ? 1.0 / (1.0 + exp(-v)) : sqrt(v > 20.0 ? v : log(1.0 + exp(v)));
         }
     }
     barrier();
     for (int e = tid; e < p.E; e += 256) {
         float v = sc[A(e)];
-        if (p.has_bias != 0) v += bias[p.b_off + e];   // without a bias the logits are bound here (vkc_route)
+        if (p.has_bias == 1) v += bias[p.b_off + e];   // without a bias the logits are bound here (vkc_route)
         pk[e] = isnan(v) ? NEG : v;
     }
     barrier();
