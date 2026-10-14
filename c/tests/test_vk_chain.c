@@ -1460,6 +1460,76 @@ static void test_situ(float b1, float b2) {
     vkc_free(gb); vkc_free(ub); vkc_free(yb); free(ga); free(ua); free(rr); free(y);
 }
 
+/* ---- the router's pick (chain_route.comp) ------------------------------------------------
+ * Against the engines' own routing, written out once: olmoe.c's and qwen36.c's softmax
+ * top-k (qwen36's group-limited form), the sigmoid with a bias that picks (colibri.c,
+ * glm53.c, kimi_k3.c), deepseek_v41.c's moe_gate (sqrt(softplus), the temperature, its
+ * norm from K > 1 with 1e-20). The ids exactly, the weights to 1e-5. */
+static void route_ref(const float *lg, const float *bias, int E, int K, int kind, int has_bias, int ng, int tg, int norm,
+                      float temp, float scale, float eps, int *ids, float *w) {
+    float sc[1024], pk[1024];
+    if (kind == 0) {
+        float m = -1e30f; for (int e = 0; e < E; e++) if (lg[e] / temp > m) m = lg[e] / temp;
+        float s = 0; for (int e = 0; e < E; e++) { sc[e] = expf(lg[e] / temp - m); s += sc[e]; }
+        for (int e = 0; e < E; e++) sc[e] /= s;
+    } else for (int e = 0; e < E; e++) {
+        float v = lg[e] / temp;
+        sc[e] = kind == 1 ? sigm(v) : sqrtf(v > 20.0f ? v : logf(1.0f + expf(v)));
+    }
+    for (int e = 0; e < E; e++) pk[e] = sc[e] + (has_bias ? bias[e] : 0.f);
+    unsigned char keep[1024]; memset(keep, 1, sizeof keep);
+    if (ng > 1) {
+        int per = E / ng; float gs[64]; unsigned char gk[64] = {0};
+        for (int g = 0; g < ng; g++) {
+            float b1 = -1e30f, b2 = -1e30f;
+            for (int e = g * per; e < g * per + per; e++) { float v = pk[e]; if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) b2 = v; }
+            gs[g] = b1 + b2;
+        }
+        for (int k = 0; k < tg; k++) { int bg = -1; float bv = -1e30f; for (int g = 0; g < ng; g++) if (!gk[g] && gs[g] > bv) { bv = gs[g]; bg = g; } if (bg < 0) break; gk[bg] = 1; }
+        for (int e = 0; e < E; e++) keep[e] = gk[e / per];
+    }
+    for (int k = 0; k < K; k++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            if (!keep[e]) continue;
+            int taken = 0; for (int j = 0; j < k; j++) if (ids[j] == e) { taken = 1; break; }
+            if (!taken && pk[e] > bv) { bv = pk[e]; best = e; }
+        }
+        ids[k] = best; w[k] = best >= 0 ? sc[best] : 0.f;
+    }
+    float sum = 0; for (int k = 0; k < K; k++) sum += w[k];
+    float div = sum + eps;
+    if ((norm == 1 || (norm == 2 && K > 1)) && div > 0) for (int k = 0; k < K; k++) w[k] /= div;
+    for (int k = 0; k < K; k++) w[k] *= scale;
+}
+static void test_route(const char *what, int S, int E, int K, int kind, int has_bias, int ng, int tg, int norm,
+                       float temp, float scale, float eps, int ties) {
+    int lrow = E + 3, irow = K + 2, wrow = K + 1;
+    float *lg = fvec((size_t)S * lrow, 4.f), *bias = fvec((size_t)E + 5, 0.3f);
+    if (ties) for (size_t i = 0; i < (size_t)S * lrow; i++) lg[i] = 0.5f;
+    int *rid = malloc((size_t)S * K * sizeof(int)); float *rw = malloc((size_t)S * K * sizeof(float));
+    for (int s = 0; s < S; s++)
+        route_ref(lg + (size_t)s * lrow + 1, bias + 2, E, K, kind, has_bias, ng, tg, norm, temp, scale, eps,
+                  rid + (size_t)s * K, rw + (size_t)s * K);
+    VkcBuf *lb = up(lg, (size_t)S * lrow), *bb = up(bias, (size_t)E + 5);
+    VkcBuf *ib = vkc_buf((size_t)(S * irow + 4) * 4, VKC_DEV), *wb = vkc_buf((size_t)(S * wrow + 4) * 4, VKC_DEV);
+    VkcRoute rp = {S, E, K, kind, 1, lrow, 2, has_bias, 3, irow, 1, wrow, ng, tg, norm, temp, scale, eps};
+    int ok = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
+    float *gi = down(ib, 3, (size_t)S * irow), *gw = down(wb, 1, (size_t)S * wrow);
+    int same = 1; double worst = 0;
+    for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) {
+        int id; memcpy(&id, &gi[(size_t)s * irow + k], 4);
+        same &= id == rid[(size_t)s * K + k];
+        double r = rw[(size_t)s * K + k], g = gw[(size_t)s * wrow + k], d = fabs(g - r) / (fabs(r) > 1e-30 ? fabs(r) : 1.0);
+        if (d > worst) worst = d;
+    }
+    CHECK(ok && same && worst < 1e-5, "route %s (S %d E %d K %d): ok %d, ids %s, weights off by %.2e",
+          what, S, E, K, ok, same ? "the CPU's" : "DIFFER", worst);
+    if (getenv("VKC_TEST_VERBOSE")) printf("route %s: weights %.2e\n", what, worst);
+    vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
+    free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
+}
+
 /* ---- DeepSeek V4.1 / V4 attention (chain_dsv4.comp) ------------------------------------- */
 static float bf16r(float f) { uint32_t u; memcpy(&u, &f, 4); if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
                               u &= 0xffff0000u; memcpy(&f, &u, 4); return f; }
@@ -2724,6 +2794,21 @@ int main(int argc, char **argv) {
         test_ares(1, 128, 0); test_ares(3, 128, 1); test_ares(5, 300, 4); test_ares(2, 7168, 8); test_ares(4, 96, 15);
         test_situ(1.f, 1.f); test_situ(4.f, 25.f);
         printf("ares done\n");
+    }
+    if (!vkc_route_ready()) { fails++; printf("FAIL: the route shader did not load\n"); }
+    else {
+        test_route("olmoe softmax", 5, 64, 8, 0, 0, 1, 1, 0, 1.f, 1.f, 0.f, 0);
+        test_route("qwen36 softmax, norm", 7, 256, 8, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
+        test_route("qwen36 group-limited", 3, 128, 8, 0, 0, 8, 4, 1, 1.f, 1.f, 0.f, 0);
+        test_route("glm53 sigmoid, bias, scale", 4, 256, 8, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
+        test_route("kimi sigmoid top-16 of 896", 3, 896, 16, 1, 1, 1, 1, 1, 1.f, 2.827f, 0.f, 0);
+        test_route("deepseek sqrt(softplus)", 5, 256, 6, 2, 1, 1, 1, 2, 1.3f, 1.5f, 1e-20f, 0);
+        test_route("deepseek K = 1 (no norm)", 2, 256, 1, 2, 1, 1, 1, 2, 1.f, 1.5f, 1e-20f, 0);
+        test_route("1024 experts, top-32", 2, 1024, 32, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
+        test_route("896 experts, top-32, bias", 3, 896, 32, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
+        test_route("fewer kept experts than K", 2, 64, 32, 0, 0, 8, 2, 1, 1.f, 1.f, 0.f, 0);
+        test_route("ties: the lower expert", 2, 64, 4, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 1);
+        printf("route done\n");
     }
     if (vkc_sconv_ready() && vkc_relattn_ready()) {
         test_inkling();

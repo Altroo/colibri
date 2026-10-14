@@ -53,15 +53,15 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
-enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_N };
+enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
 static const char *const mla_file[PM_N] = {"chain_mla.spv", "chain_hgemv.spv", "chain_dsa.spv", "chain_kda.spv",
-                                           "chain_mhc.spv", "chain_ares.spv"};
+                                           "chain_mhc.spv", "chain_ares.spv", "chain_route.spv"};
 #define VKC_KDA_MAX 8
 
 /* ---- memory: blocks per kind, buffers bound at offsets inside them -------------- */
@@ -1255,6 +1255,22 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
 }
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
+/* the router's pick (chain_route.comp): one workgroup per row */
+int vkc_route_ready(void) { return vkc_ready() && KC.mpipe[PM_ROUTE]; }
+int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p) {
+    KC.kind = PK_ROUTE;
+    if (!KC.mpipe[PM_ROUTE] || p->S < 1 || p->E < 1 || p->E > VKC_ROUTE_EMAX || p->K < 1 || p->K > VKC_ROUTE_KMAX ||
+        p->K > p->E || p->kind < 0 || p->kind > 2 || (p->has_bias && !bias) || !(p->temp > 0.0f) ||
+        (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group)))
+        return 0;
+    /* without a bias the logits stand in for it, at their own offset: a device that reads
+     * both sides of the shader's choice stays in bounds (the 256-byte dummy would not) */
+    VkcRoute q = *p;
+    if (!q.has_bias) q.b_off = q.l_off;
+    VkcBind bd[4] = {B(logits, 0), B(q.has_bias ? bias : logits, 0), B(ids, 1), B(w, 1)};
+    uint32_t gx, gy; grid((uint64_t)q.S, &gx, &gy);
+    return record(KC.mpipe[PM_ROUTE], bd, 4, &q, sizeof q, gx, gy, 1);
+}
 int vkc_ares_ready(void) { return vkc_ready() && KC.mpipe[PM_ARES]; }
 int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
     KC.kind = PK_ARES;
