@@ -335,7 +335,7 @@ int  coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, floa
  *   coli_vk_dev_info       what the tier sizes itself by, for either device
  *   coli_vk_tier_tensor_dev  coli_vk_tier_tensor in that device's tier pool
  *   coli_vk_xb_*_dev       coli_vk_xb_init/_ready/_issue_w/_join/_stats on that device;
- *                          _busy_dev: a batch in flight there */
+ *                          _busy_dev: a batch (or a sub-batch) in flight there */
 typedef struct {
     const char *name;
     int integrated, shares_ram;       /* shares_ram: an integrated GPU or a CPU device */
