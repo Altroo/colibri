@@ -34,8 +34,12 @@ custom `stop` sequences. `max_tokens` is a ceiling, not a target: when the
 prompt leaves less room than the budget asks for, every engine clamps the
 budget to what the context holds and the reply ends with `finish_reason:
 "length"`; only a prompt that does not fit is refused, with
-`context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes.
+`context_length_exceeded` (#260, #1641). A request without a budget gets the server's
+ceiling (`--max-tokens`, reported by `GET /health` as `max_tokens`); a chat server started by
+`coli serve`, `coli web` or `coli chat` without `--ngen` sets none, so a response may run to
+the end of the context: a reasoning model's turn is its reasoning plus its answer (#382).
+Stop sequences are removed from the response and end generation early in both JSON and
+streaming modes.
 
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
