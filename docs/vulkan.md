@@ -17,7 +17,9 @@ PIN=<model>/.coli_usage PIN_GB=0 COLI_NO_OMP_TUNE=1 \
 Requirements: a Vulkan **1.2** driver with
 `GL_KHR_shader_subgroup_arithmetic` (any Mesa RADV, AMDVLK, NVIDIA or Intel
 ANV driver from the last several years), plus the Vulkan headers and `glslc`
-at build time. The
+at build time. On Debian and Ubuntu that is `sudo apt install libvulkan-dev glslc`
+(`glslc` is its own package there, not part of `libvulkan-dev` or `vulkan-tools`;
+without it `make VK=1` stops at `glslc not found`). The
 backend picks the most capable physical device (discrete > integrated) and
 degrades to the CPU path on any failure — a wedged GPU can slow a run, never
 corrupt it.
@@ -165,6 +167,15 @@ them by f32 activations.
     expert makes ([DeepSeek V4's activation](#deepseek-v4s-activation)).
   - inkling leaves its bf16 matrices on the CPU when the build has the AVX512-BF16
     dot (Zen 4/5, Sapphire Rapids), because that dot rounds activations to bf16.
+
+**Run to run.** The dense chain alone gives the same tokens on every run. With the
+routed-expert tier on, a run is not bit-reproducible by default: which experts a step
+finds on the device depends on when the uploader finished, and the balancer moves rows
+between the device and the CPU on measured times. The device's experts compute as
+above, so a different split changes the last bits, and over many layers of routing
+near-ties that can change a greedy token. `COLI_VK_TIER_SYNC=1
+COLI_VK_TIER_BALANCE=0` make the residency and the split follow the routing alone
+(each step waits for its uploads, so it is slower): the runs then repeat (#2081).
 
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
