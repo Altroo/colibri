@@ -2886,6 +2886,70 @@ int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const flo
     return upload_tensor_d2(tensor, weights, scales, fmt, I, O, grp);
 }
 
+/* ---- f32 matrices that are bf16 or f16 widened -------------------------------------
+ * Engines keep their dense matrices as f32 on the host, read from bf16 or f16
+ * checkpoints. From bf16 every float has a zero low half; from f16 every float is one an
+ * f16 holds exactly. Either way a 2-byte device copy holds the same values in half the
+ * bytes: fmt 11 (bf16) or fmt 14 (f16). OLMoE-1B-7B's dense part takes 0.75 GB of VRAM
+ * instead of 1.5. A matrix with any other float stays fmt 10. */
+/* f32 bits an f16 holds exactly: a normal half (10 bits of mantissa), a subnormal one
+ * (k * 2^-24, k < 1024), a zero, an infinity, or a NaN whose payload fits */
+static int f32_is_f16(uint32_t u) {
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return 1;
+    if (e == 128) return (m & 0x1fffu) == 0;
+    if (e > 15 || e < -24) return 0;
+    if (e >= -14) return (m & 0x1fffu) == 0;
+    return ((m | 0x800000u) & ((1u << (-1 - e)) - 1)) == 0;   /* subnormal: k = sig >> (-1 - e) */
+}
+/* the f16 of such bits */
+static uint16_t f32_to_f16_exact(uint32_t u) {
+    const uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+    const uint32_t a = u & 0x7fffffffu, m = a & 0x7fffffu;
+    const int e = (int)(a >> 23) - 127;
+    if (!a) return sign;
+    if (e == 128) return (uint16_t)(sign | 0x7c00u | (m >> 13));
+    if (e >= -14) return (uint16_t)(sign | ((uint32_t)(e + 15) << 10) | (m >> 13));
+    return (uint16_t)(sign | ((m | 0x800000u) >> (-1 - e)));
+}
+int coli_vk_f32_fmt(const float *w, size_t n) {
+    const uint32_t *u = (const uint32_t *)w;
+    int bf16 = 1, f16 = 1;
+    for (size_t i = 0; i < n && (bf16 || f16); i++) {
+        if (u[i] & 0xffffu) bf16 = 0;
+        if (f16 && !f32_is_f16(u[i])) f16 = 0;
+    }
+    return bf16 ? 11 : f16 ? 14 : 10;
+}
+size_t coli_vk_f32_payload(const float *w, int I, int O) {
+    return coli_vk_tensor_payload(w ? coli_vk_f32_fmt(w, (size_t)I * O) : 10, I, O, 0);
+}
+int coli_vk_tensor_ensure_f32(ColiVkTensor **tensor, const float *w, int I, int O, int dev2) {
+    if (*tensor) {
+        const int f = (*tensor)->fmt;
+        return (f == 10 || f == 11 || f == 14) && (*tensor)->I == I && (*tensor)->O == O;
+    }
+    if (!w) return 0;
+    size_t n = (size_t)I * O;
+    const int fmt = coli_vk_f32_fmt(w, n);
+    if (fmt == 10)
+        return dev2 ? coli_vk_tensor_ensure2(tensor, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(tensor, w, NULL, 10, I, O, 0);
+    uint16_t *h = malloc(n * sizeof *h);
+    if (!h) return 0;
+    const uint32_t *u = (const uint32_t *)w;
+    if (fmt == 11) for (size_t i = 0; i < n; i++) h[i] = (uint16_t)(u[i] >> 16);
+    else           for (size_t i = 0; i < n; i++) h[i] = f32_to_f16_exact(u[i]);
+    /* the uploads are done when they return (staged ones wait for their copies) */
+    int ok = dev2 ? coli_vk_tensor_ensure2(tensor, h, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(tensor, h, NULL, fmt, I, O, 0);
+    free(h);
+    return ok;
+}
+int coli_vk_matmul_f32(ColiVkTensor **tensor, float *y, const float *x, const float *w, int S, int I, int O) {
+    if (!G.ready || !coli_vk_tensor_ensure_f32(tensor, w, I, O, 0)) return 0;
+    return coli_vk_matmul(tensor, y, x, NULL, NULL, (*tensor)->fmt, S, I, O, 0);
+}
+
 /* dev2 mirror of eg_prepare_submit: identical structure on G2's pipelines/scratches. */
 static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                               ColiVkTensor *const *downs, const int *rows, int count,
