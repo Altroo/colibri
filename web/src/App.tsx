@@ -297,6 +297,7 @@ export default function App() {
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         compact: supportsCompaction(health),
+        keepReasoning: supportsCompaction(health),
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
            first one is the real time-to-first-token. The answer's first token
