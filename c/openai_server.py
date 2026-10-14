@@ -6877,6 +6877,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(data)
                 return
