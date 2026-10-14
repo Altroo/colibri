@@ -282,8 +282,10 @@ family_staged_faults() {
   done
   rm -f hist.usage
   # the chain: a failure before it starts declines it (or leaves one matrix behind), a
-  # lost device in the middle has the CPU rebuild the state
-  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  # lost device in the middle has the CPU rebuild the state. The warm start fills no
+  # device here (COLI_VK_TIER_FILL=0): the fill's uploads would take the waits counted
+  # from the run's submits, and wait:S-2 would land before the chain's first step
+  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_FILL=0)
   fault_run "faults: qwen36 chain, none" "" q.tok "${C[@]}" -- "${q[@]}"
   S=$(fault_num 's/.*copies (\([0-9]*\) submits).*/\1/p' vk.log)
   for f in stage:1 block:1 record:4 submit:4 commit:1 wait:4 wait:$((S - 2)); do
