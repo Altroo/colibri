@@ -171,6 +171,10 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
                   const float *gate, const float *bias,
                   const int *forced_indices, int experts, int dimension,
                   int topk, float route_scale);
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
