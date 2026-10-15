@@ -277,6 +277,31 @@ class BackendChoice(unittest.TestCase):
             self.assertEqual(decision["missing"][0][0], "cuda")
             self.assertIn("windows-x86_64-cuda.zip", decision["missing"][0][1])
 
+    def test_windows_without_engines_takes_the_release_cuda_backend(self):
+        # #2091: with nothing here, the setup takes the Windows release, whose CUDA
+        # backend it fetches too (fetch_release_cuda); before, it took only the Vulkan
+        # engines and an RTX 5080 ran Vulkan
+        tc = dict(TC_ALL, source_checkout=True, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        card = dict(RTX, name="NVIDIA GeForce RTX 5080", compute_cap="12.0")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertEqual(decision["gpu"], card["name"])
+        self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
+        old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[old]), family="kimi", tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
+        # an engine the release carries no CUDA build of, or a compiler here: as before
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="mimo", tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertEqual(decision["missing"][0][0], "cuda")
+        # and on Linux the release has no CUDA backend to fetch
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc)
+        self.assertNotEqual(decision["backend"], "cuda")
+
     def test_no_compiler_counts_on_the_release_vulkan_engine(self):
         # nothing here builds and no engine is here: resolve_engine downloads the
         # release's, which are Vulkan builds on Linux and Windows x86_64
@@ -936,6 +961,55 @@ class Releases(HomeTestCase):
                 setup_flow.resolve_engine(family_by_id("qwen36"), setup_catalog.by_id("qwen3-coder-30b"),
                                           {"backend": "cpu", "missing": []}, tc, out=out.append)
             self.assertIn("predates", str(caught.exception))
+
+    def cuda_archive(self, tag):
+        """The release's windows-x86_64-cuda.zip: the engines again, built to load
+        coli_cuda.dll, the DLL and its runtime."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("qwen36.exe", b"engine coli_cuda.dll vulkan-1.dll")
+            zf.writestr("coli_cuda.dll", b"MZ")
+            zf.writestr("cudart64_12.dll", b"MZ")
+            zf.writestr("README-CUDA.txt", f"colibri {tag}: the CUDA backend for Windows")
+        return buffer.getvalue()
+
+    def windows_release(self, tag, folder, cuda=True):
+        """The Windows release over HTTP, with its CUDA backend or (an older one) without."""
+        name = f"colibri-{tag}-windows-x86_64.zip"
+        files = {name: self.make_archive("win32", vulkan=True)}
+        if cuda:
+            files[f"colibri-{tag}-windows-x86_64-cuda.zip"] = self.cuda_archive(tag)
+        files["SHA256SUMS.txt"] = "".join(f"{hashlib.sha256(data).hexdigest()}  {n}\n"
+                                          for n, data in files.items()).encode()
+        urls = self.serve_release(files, folder=folder)
+        return lambda url: {"tag_name": tag, "assets": [{"name": n, "browser_download_url": u}
+                                                        for n, u in urls.items()]}
+
+    def test_the_windows_release_brings_its_cuda_backend(self):
+        # #2091: a CUDA choice on Windows with no engine here takes the release's
+        # engines and unpacks its CUDA backend over them
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        for cuda in (True, False):
+            with self.subTest(cuda=cuda):
+                empty = os.path.join(self.tmp.name, f"nothing-here-{cuda}")
+                os.makedirs(empty)
+                getter = self.windows_release("v2.1.0", f"release-{cuda}", cuda=cuda)
+                with modeled("win32"), mock.patch.object(setup_flow, "HERE", empty), \
+                     mock.patch.dict(os.environ, {"COLI_SETUP_HOME": os.path.join(self.tmp.name, f"h-{cuda}")}), \
+                     mock.patch.object(setup_flow, "_api_get", side_effect=getter):
+                    out = []
+                    info = setup_flow.resolve_engine(family_by_id("qwen36"), setup_catalog.by_id("qwen36-35b"),
+                                                     {"backend": "cuda", "missing": []}, tc, out=out.append)
+                    said = "\n".join(out)
+                    if cuda:
+                        self.assertEqual(info["backend"], "cuda")
+                        self.assertTrue(setup_flow.prebuilt_runs(family_by_id("qwen36"), "cuda",
+                                                                 info["launcher_dir"]))
+                        self.assertIn("downloading the CUDA backend of v2.1.0", said)
+                        self.assertFalse(os.path.exists(info["launcher_dir"] + ".cuda"))
+                    else:   # a release from before the backend: its Vulkan engines
+                        self.assertEqual(info["backend"], "vulkan")
+                        self.assertIn("release v2.1.0 has no windows-x86_64-cuda.zip: using Vulkan", said)
 
     def test_bad_checksum_is_refused(self):
         tag = "v1.12.1"
@@ -1625,6 +1699,128 @@ class ConfiguredRefresh(HomeTestCase):
         self.assertEqual(build.call_args.args[1], "cuda")
         self.assertEqual(build.call_args.kwargs["make_args"],
                          setup_flow.cuda_make_args(family_by_id("qwen36"), tc, cfg["nvidia"]))
+
+
+class ConfiguredCuda(Releases):
+    """A saved run configuration that is not on CUDA where the engine runs CUDA now
+    (#2091): the setup's own Vulkan choice kept COLI_VULKAN=1 on a CUDA box."""
+
+    CARD = {"name": "NVIDIA GeForce RTX 5080", "compute_cap": "12.0"}
+
+    def configured(self, engines, backend="vulkan", requested="auto", cards=None, family="qwen36"):
+        model = os.path.join(self.tmp.name, "model")
+        os.makedirs(model, exist_ok=True)
+        Path(engines, "coli").write_text("# launcher")
+        name = family_by_id(family).engine_artifact + ".exe"
+        engine = os.path.join(engines, name)
+        info = {"launcher_dir": engines, "engine": engine, "backend": backend, "source": "present"}
+        with modeled("win32"):
+            cfg = setup_flow.make_config(model_dir=model, family=family_by_id(family), entry=None,
+                                         engine_info=info, hw=hw_report(vulkan=DGPU), host="127.0.0.1",
+                                         port=8000)
+        cfg.update(requested_backend=requested, nvidia=[self.CARD] if cards is None else cards)
+        return setup_flow.save_config(cfg)
+
+    def windows_engines(self, folder, dll=True):
+        os.makedirs(os.path.join(folder, "shaders"), exist_ok=True)
+        Path(folder, "shaders", "qmatmul.spv").write_bytes(b"\x03\x02\x23\x07")
+        Path(folder, "qwen36.exe").write_bytes(b"engine coli_cuda.dll vulkan-1.dll" if dll
+                                               else b"engine vulkan-1.dll")
+        if dll:
+            Path(folder, "coli_cuda.dll").write_bytes(b"MZ")
+
+    def rerun(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(setup_flow.cmd_setup(setup_args()), 0)
+        return out.getvalue()
+
+    def test_the_cuda_package_unpacked_after_the_setup_is_taken(self):
+        engines = os.path.join(self.tmp.name, "colibri-2.1.0")
+        self.windows_engines(engines)
+        self.configured(engines)
+        self.assertEqual(setup_flow.load_config()["env"]["COLI_VULKAN"], "1")
+        with modeled("win32"):
+            said = self.rerun()
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["backend"], "cuda")
+        self.assertEqual(cfg["gpu"], self.CARD["name"])
+        self.assertNotIn("COLI_VULKAN", cfg["env"])
+        self.assertNotIn("COLI_VK_SHADERS", cfg["env"])
+        self.assertEqual(cfg["args"][cfg["args"].index("--gpu") + 1], "auto")
+        self.assertEqual(cfg["args"].count("--auto-tier"), 1)
+        self.assertIn("CUDA from now on: NVIDIA GeForce RTX 5080 (compute 12.0) with coli_cuda.dll "
+                      "beside the engine; the last setup saved Vulkan.", said)
+        with modeled("win32"):     # and once it is on CUDA, nothing more to say
+            self.assertNotIn("CUDA from now on", self.rerun())
+
+    def test_coli_start_takes_it_too(self):
+        engines = os.path.join(self.tmp.name, "colibri-2.1.0")
+        self.windows_engines(engines)
+        self.configured(engines)
+        out = io.StringIO()
+        with modeled("win32"), contextlib.redirect_stdout(out), \
+             mock.patch.object(setup_flow, "start_server", return_value=0) as start:
+            setup_flow.cmd_start(argparse.Namespace(json=False, background=False, no_browser=True))
+        self.assertEqual(start.call_args.args[0]["backend"], "cuda")
+        self.assertNotIn("COLI_VULKAN", start.call_args.args[0]["env"])
+        self.assertEqual(setup_flow.load_config()["backend"], "cuda")
+        self.assertIn("CUDA from now on", out.getvalue())
+
+    def test_a_backend_asked_for_or_a_card_the_dll_does_not_run_on_stays(self):
+        engines = os.path.join(self.tmp.name, "colibri-2.1.0")
+        self.windows_engines(engines)
+        for kwargs in ({"requested": "vulkan"}, {"requested": "cpu", "backend": "cpu"},
+                       {"cards": [{"name": "NVIDIA GeForce RTX 2070", "compute_cap": "7.5"}]},
+                       {"cards": []}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                cfg = self.configured(engines, **kwargs)
+                with modeled("win32"):
+                    self.assertIsNone(setup_flow.cuda_unused(cfg))
+                    self.assertIsNone(setup_flow.release_cuda_missing(cfg))
+        without = os.path.join(self.tmp.name, "no-dll")
+        self.windows_engines(without, dll=False)
+        with modeled("win32"):
+            self.assertIsNone(setup_flow.cuda_unused(self.configured(without)))
+
+    def test_a_release_engine_from_an_older_setup_gets_its_cuda_backend(self):
+        # the reporter's state: the release's Vulkan engines in runtime/, COLI_VULKAN=1
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
+        self.windows_engines(runtime, dll=False)
+        self.configured(runtime)
+        getter = self.windows_release("v2.1.0", "release")
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", side_effect=getter):
+            said = self.rerun()
+        cfg = setup_flow.load_config()
+        self.assertIn("Release v2.1.0 has a CUDA backend for the NVIDIA card: fetching it.", said)
+        self.assertEqual(cfg["backend"], "cuda")
+        self.assertTrue(os.path.isfile(os.path.join(runtime, "coli_cuda.dll")))
+        self.assertNotIn("COLI_VULKAN", cfg["env"])
+
+    def test_a_release_without_a_cuda_backend_is_asked_once(self):
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
+        self.windows_engines(runtime, dll=False)
+        self.configured(runtime)
+        getter = mock.Mock(side_effect=self.windows_release("v2.1.0", "release", cuda=False))
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", getter):
+            self.assertIn("release v2.1.0 has no windows-x86_64-cuda.zip: keeping Vulkan", self.rerun())
+            asked = getter.call_count
+            self.assertNotIn("fetching it", self.rerun())
+        self.assertEqual(getter.call_count, asked)
+        self.assertEqual(setup_flow.load_config()["backend"], "vulkan")
+
+    def test_an_unreachable_release_is_asked_again_and_the_setup_goes_on(self):
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
+        self.windows_engines(runtime, dll=False)
+        self.configured(runtime)
+        offline = mock.Mock(side_effect=setup_flow.urllib.error.URLError("offline"))
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", offline):
+            said = self.rerun()
+            self.assertIn("the next setup tries again", said)
+            self.assertIn("Already set up", said)
+            self.rerun()
+        self.assertGreater(offline.call_count, 2)
+        self.assertEqual(setup_flow.load_config()["backend"], "vulkan")
 
 
 class CommandLine(HomeTestCase):
