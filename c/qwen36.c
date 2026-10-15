@@ -4133,13 +4133,22 @@ static int trunk_probe_gpu_wins(Model *m){
     return wins;
 }
 
-static void layers_forward_range(Model *m, float *x, int S, int pos_base,
-                                 int layer_begin, int layer_end,
-                                 int allow_prefetch, FILE *lf) {
+/* Only single-slot CPU serve prefill supplies a control callback. Other
+ * forwards, including decode, speculation and Segment, never read stdin. */
+typedef struct {
+    int (*poll)(void *ctx);
+    void *ctx;
+    int result;
+} Q36StepControl;
+
+static int layers_forward_control(Model *m, float *x, int S, int pos_base,
+                                  int layer_begin, int layer_end,
+                                  int allow_prefetch, FILE *lf, Q36StepControl *control) {
     Cfg *c = &m->c;
     int D = c->hidden;
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
+        if (control && (control->result = control->poll(control->ctx))) break;
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         double _t0 = tm_now();
@@ -4166,7 +4175,17 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
             pilot_prefetch(m, i + 3, x, S);
     }
+    /* The last layer also has a boundary, before logits and prefix recording. */
+    if (control && !control->result) control->result = control->poll(control->ctx);
     free(nrm); free(tmp);
+    return control ? control->result : 0;
+}
+
+static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+                                 int layer_begin, int layer_end,
+                                 int allow_prefetch, FILE *lf) {
+    (void)layers_forward_control(m, x, S, pos_base, layer_begin, layer_end,
+                                 allow_prefetch, lf, NULL);
 }
 
 /* Fotografia dello stato dopo un prefill "pinnato" (SUBMIT pin=1).
@@ -4234,8 +4253,12 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
  * verify), each row's logits computed as a decode step computes them. */
-static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits) {
+static void q36_prefill_abort(Model *m);
+
+static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int nlogits,
+                              Q36StepControl *control) {
     Cfg *c = &m->c; int D = c->hidden;
+    if (control) control->result = 0;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
     /* Per-layer residual dump (last token) for torch-free cosine debugging.
      * Set DUMP_LAYERS=<path> to write n_layers * D raw float32 rows. */
@@ -4303,8 +4326,15 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
-    if (!chain_logit)
-    layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1, lf);
+    if (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
+                                               c->n_layers, 1, lf, control)) {
+        /* Some layers may have advanced, others not. Neither the previous
+         * prefix nor a partially processed prompt describes this state. */
+        q36_prefill_abort(m);
+        free(x);
+        if (lf) fclose(lf);
+        return NULL;
+    }
     if (g_hidden_sink) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++)
@@ -4319,16 +4349,6 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
-    /* Serve mode can split a long prompt across several calls so CANCEL is
-     * observed during prefill.  Intermediate chunks have already advanced all
-     * model state, but do not need an expensive vocabulary projection yet.
-     * Keep first_step/resident collection open until the final chunk. */
-    if (nlogits == 0) {
-        if (tm_on()) { if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
-        free(x);
-        if (lf) fclose(lf);
-        return NULL;
-    }
     /* Lettura del prefill: una passata di lm_head per posizione, pagata SOLO
      * dalle richieste che hanno chiesto il canale. La posizione p predice il
      * token p+1, quindi si copre l'intero blocco fresco tranne il suo primo
@@ -4378,6 +4398,10 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
         }
     }
     return logit;
+}
+
+static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits) {
+    return step_ex_control(m, ids, S, pos_base, nlogits, NULL);
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
@@ -4713,6 +4737,15 @@ static void reset_recurrent(Model *m){
     q36cc_host_wrote(m, 1);
 #endif
     dn_gpu_invalidate(m);   /* zero on the host is the truth now; the card re-loads it before its next step */
+}
+
+static void q36_prefill_abort(Model *m) {
+    reset_recurrent(m);
+    m->kv_len = 0;
+    pin_drop();   /* the prefix record no longer certifies the pins' KV rows */
+    m->resident_collecting = 0;
+    m->first_step = 1;
+    if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -5322,16 +5355,8 @@ static int serve_control_pending(const char *id){
     return control;
 }
 
-/* A long CPU prompt used to be one uninterruptible step(): the gateway sent
- * CANCEL as soon as its client disappeared, but this process did not read the
- * command until prefill had finished.  Bound the serve-only prefill work so
- * every chunk is also a cancellation point.  The operator knob is mainly for
- * regression tests and slow hardware; zero disables chunking. */
-static int serve_prefill_chunk_rows(int rows){
-    const char *value = getenv("QWEN36_SERVE_PREFILL_CHUNK");
-    int chunk = value ? atoi(value) : 128;
-    if(chunk <= 0 || chunk > rows) return rows;
-    return chunk;
+static int serve_prefill_poll(void *id) {
+    return serve_control_pending((const char *)id);
 }
 
 /* --- Dashboard: Brain e Profile ------------------------------------------
@@ -5480,34 +5505,29 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
                (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
-    int fresh = np - reuse;
-    int chunk = (g_q36_mux_slots > 1 || q->logprobs > 0 || getenv("DUMP_LAYERS") || m->vis_rows
-                 || qt_ready() || qq_active())
-              ? fresh : serve_prefill_chunk_rows(fresh);
+    /* Keep all fresh rows in one pass through each layer, without adding
+     * row-chunk traversals over streamed experts when the cache is small.
+     * Poll only the CPU text path; the other backends keep their own state and
+     * the multiplexed loop exclusively owns its command stream. */
+    int interruptible = g_q36_mux_slots == 1 && q->logprobs == 0
+                       && !getenv("DUMP_LAYERS") && !m->vis_rows
+                       && !qt_ready() && !qq_active();
 #ifdef COLI_VULKAN
-    if (g_vk_ready || vkt_ready()) chunk = fresh;
+    if (g_vk_ready || vkt_ready()) interruptible = 0;
 #endif
 #ifdef COLI_CUDA
-    if (g_cuda_chain) chunk = fresh;
+    if (g_cuda_chain) interruptible = 0;
 #endif
-    int fed = 0, prefill_control = Q36_CONTROL_NONE;
+    Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
+    int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
-    while(fed < fresh){
-        /* Check before the first chunk too: CANCEL may already be buffered by
-         * the time tokenization and cache preparation finish. */
-        /* The multiplexed loop owns its command stream: this single-slot
-         * poll would discard another slot's SUBMIT or IMAGE payload. */
-        if(g_q36_mux_slots == 1 &&
-           (prefill_control = serve_control_pending(q->id)) != Q36_CONTROL_NONE) break;
-        int rows = fresh - fed;
-        if(rows > chunk) rows = chunk;
-        int final_chunk = fed + rows == fresh;
-        lo = step_ex(m, ids + reuse + fed, rows, reuse + fed, final_chunk);
-        fed += rows;
+    if (!prefill_control) {
+        lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
+                             interruptible ? &control : NULL);
+        prefill_control = control.result;
     }
-    /* A disconnect during the final chunk must be honored before the first
-     * DATA frame; otherwise a closed client still receives one token before
-     * the engine notices the queued CANCEL. */
+    /* Also honor a control arriving during the final projection before DATA.
+     * In that case the fully completed prefix is still safe to reuse. */
     if(g_q36_mux_slots == 1 && !prefill_control) prefill_control = serve_control_pending(q->id);
     if(prefill_control){
         free(lo);

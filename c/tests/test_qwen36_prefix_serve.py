@@ -53,44 +53,40 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
         self.addCleanup(engine.close)
         return engine
 
-    def test_cancel_during_prefill_does_not_process_the_whole_prompt(self):
-        self.control_during_prefill("CANCEL")
+    def test_queued_cancel_skips_prefill_and_emits_no_data(self):
+        self.control_before_prefill("CANCEL")
 
-    def test_stop_during_prefill_is_successful_and_preserves_next_turn(self):
-        self.control_during_prefill("STOP")
+    def test_queued_stop_is_successful_and_preserves_next_turn(self):
+        self.control_before_prefill("STOP")
 
-    def control_during_prefill(self, command):
+    def control_before_prefill(self, command):
         engine = ServeEngine(
             ENGINE,
             ["8", "8"],
-            {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
-             "QWEN36_SERVE_PREFILL_CHUNK": "1"},
+            {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0"},
             log_prefix=True,
         )
         self.watch(engine)
         prompt = b"x" * 400
+        # Queue the control with the request, so this checks wire semantics
+        # without racing completion on fast hosts. The native callback test
+        # separately interrupts at EVERY real hybrid layer boundary.
         engine.p.stdin.write(
             f"SUBMIT cancel-prefill 0 {len(prompt)} 4 0 1\n".encode()
-            + prompt + b"\n"
+            + prompt + b"\n" + f"{command} cancel-prefill\n".encode()
         )
         engine.p.stdin.flush()
-
-        while True:
-            line = engine.p.stdout.readline()
-            self.assertTrue(line, "engine exited before accepting cancellation test")
-            accepted = line.decode("latin-1").strip()
-            if accepted.startswith("ACCEPT cancel-prefill "):
-                break
-        engine.p.stdin.write(f"{command} cancel-prefill\n".encode())
-        engine.p.stdin.flush()
-
+        accepted = False
         while True:
             line = engine.p.stdout.readline()
             self.assertTrue(line, "engine exited before acknowledging cancellation")
             text = line.decode("latin-1").strip()
+            if text.startswith("ACCEPT cancel-prefill "):
+                accepted = True
             if text.startswith("DATA cancel-prefill "):
                 self.fail("engine generated data before honoring a prefill cancellation")
             if text.startswith(("ERROR cancel-prefill ", "DONE cancel-prefill ")):
+                self.assertTrue(accepted, "terminal frame before ACCEPT")
                 if command == "CANCEL":
                     self.assertEqual(text, "ERROR cancel-prefill CANCELLED")
                 else:
@@ -107,28 +103,26 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
         self.assertNotIn("[PREFIX] reusing 400 of 401 prompt tokens", log,
                          f"{command} was acknowledged only after all 400 prompt tokens ran")
 
-    def test_chunked_prefill_matches_whole_prompt(self):
+    def test_layer_polled_prefill_matches_unpolled_mux(self):
         opening = b"Repeated prefix. " * 20
         prompts = [opening, opening + b" More context. " * 12,
                    b"def process(items): return sorted(set(items))\n" * 7]
         for dense in ("0", "1"):
-            for rows in (1, 7, 128):
-                with self.subTest(rows=rows, dense=dense):
+            for cap in (1, 8):
+                with self.subTest(cap=cap, dense=dense):
                     env = {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": dense}
-                    chunked = self.watch(ServeEngine(ENGINE, ["8", "8"], dict(
-                        env, QWEN36_SERVE_PREFILL_CHUNK=str(rows))))
-                    whole = self.watch(ServeEngine(ENGINE, ["8", "8"], dict(
-                        env, QWEN36_SERVE_PREFILL_CHUNK="0")))
+                    polled = self.watch(ServeEngine(ENGINE, [str(cap), "8"], dict(env, KV_SLOTS="1")))
+                    whole = self.watch(ServeEngine(ENGINE, [str(cap), "8"], dict(env, KV_SLOTS="2")))
                     try:
                         for index, prompt in enumerate(prompts):
                             # One token on the opening leaves exactly its prompt
                             # in the KV state; turn 2 must then reuse that prefix.
                             count = 1 if index == 0 else 8
-                            self.assertEqual(chunked.ask(f"chunk-{index}", prompt, max_tok=count),
+                            self.assertEqual(polled.ask(f"polled-{index}", prompt, max_tok=count),
                                              whole.ask(f"whole-{index}", prompt, max_tok=count))
-                        self.assertIn(f"[PREFIX] reusing {len(opening)} of", chunked.close())
+                        self.assertIn(f"[PREFIX] reusing {len(opening)} of", polled.close())
                     finally:
-                        chunked.close()
+                        polled.close()
                         whole.close()
 
     def test_multiplexed_submissions_are_not_consumed_by_cancel_poll(self):
@@ -138,8 +132,7 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
             wire += f"SUBMIT {rid} {slot} {len(prompt)} 4 0 1\n".encode() + prompt + b"\n"
         result = subprocess.run([str(ENGINE), "8", "8"], input=wire, capture_output=True,
                                 timeout=30, env=dict(os.environ, SNAP=str(FIXTURE),
-                                SERVE="1", KV_SLOTS="2", COLI_DENSE_I8="0",
-                                QWEN36_SERVE_PREFILL_CHUNK="1"))
+                                SERVE="1", KV_SLOTS="2", COLI_DENSE_I8="0"))
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         for rid in ("mux-a", "mux-b"):
             self.assertIn(f"DONE {rid} STAT".encode(), result.stdout)
