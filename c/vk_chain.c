@@ -101,6 +101,7 @@ typedef struct {
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkShaderModule mod_moe; VkPipeline moe;                   /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress) */
+    int moe_xs, moe_tried;                                    /* its staging floats (0: the device cannot); built once asked for */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -425,17 +426,14 @@ int vkc_init(void) {
     VkPhysicalDeviceSubgroupProperties msg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &msg};
     vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &mp2);
+    /* built at the first vkc_moe_ready (moe_build): only an engine that runs its experts
+     * in the frame pays for it. Built here for every engine, it cost a software device an
+     * LLVM compile whose memory the process kept: GLM's resident set at exit, +100 MiB on
+     * Lavapipe, no longer fell by what its dense weights gave back */
     if (KC.core.bda && (msg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) &&
-        (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
-        (KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) {
+        (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
         int32_t xs = (int32_t)(kc_shared_limit() / 4) & ~3;
-        if (xs > 8192) xs = 8192;
-        VkSpecializationMapEntry me = {0, 0, 4};
-        VkSpecializationInfo si = {1, &me, 4, &xs};
-        double t0 = vkc_now_ms();
-        if (xs >= 1024) KC.moe = make_pipe(KC.mod_moe, &si);
-        double dt = vkc_now_ms() - t0;
-        if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv took %.1f s to build\n", dt / 1e3);
+        KC.moe_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -1300,10 +1298,23 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
 }
 /* the routed experts (chain_moe.comp): gate and up of every (row, slot), then down and
  * the weighted sum of each row's slots */
-int vkc_moe_ready(void) { return vkc_ready() && KC.moe; }
+static int moe_build(void) {
+    if (KC.moe || KC.moe_tried || !KC.moe_xs) return KC.moe != VK_NULL_HANDLE;
+    KC.moe_tried = 1;
+    if (!(KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) return 0;
+    int32_t xs = KC.moe_xs;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &xs};
+    double t0 = vkc_now_ms();
+    KC.moe = make_pipe(KC.mod_moe, &si);
+    double dt = vkc_now_ms() - t0;
+    if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv took %.1f s to build\n", dt / 1e3);
+    return KC.moe != VK_NULL_HANDLE;
+}
+int vkc_moe_ready(void) { return vkc_ready() && moe_build(); }
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
     KC.kind = PK_MOE;
-    if (!KC.moe || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
+    if (!moe_build() || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
         (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
         hid == x || hid == y || y == x) return 0;
     if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
