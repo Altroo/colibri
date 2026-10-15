@@ -3161,6 +3161,22 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
+def _proc_state(pid):
+    """The state letter of `pid` (R, S, Z, ...), None when it cannot be read.
+    Linux: /proc/<pid>/stat, after the command name. Elsewhere (macOS, the BSDs:
+    no /proc) the first letter of `ps -o stat=`."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f: stat = f.read()
+        return stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3].decode()
+    except (OSError, ValueError):
+        if os.path.isdir("/proc/self"): return None
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[:1] or None
+
+
 def _pid_alive(pid):
     """Is `pid` a live process?
 
@@ -3176,12 +3192,8 @@ def _pid_alive(pid):
         except OSError: return False
         # A zombie answers kill(0) but is gone: it holds no memory, and only its
         # parent can reap it, so cmd_stop's check that everything ended must not
-        # wait on it (Linux: state Z in /proc/<pid>/stat, after the command name).
-        try:
-            with open(f"/proc/{pid}/stat", "rb") as f: stat = f.read()
-            return stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3] != b"Z"
-        except (OSError, ValueError):
-            return True
+        # wait on it.
+        return _proc_state(pid) != "Z"
     import ctypes
     from ctypes import wintypes
     PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259

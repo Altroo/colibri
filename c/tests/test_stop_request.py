@@ -179,16 +179,19 @@ class StopRequest(unittest.TestCase):
         self.assertIsNotNone(child.wait(timeout=10))
         self.assertIsNone(coli._win_terminate(child.pid), "an ended process is not an error")
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "/proc")
+    @unittest.skipIf(sys.platform == "win32", "no zombies: an ended process is gone")
     def test_a_zombie_is_not_alive(self):
+        # Linux reads the state in /proc, macOS (no /proc) in ps: there both stop tests
+        # above failed with "could not stop" on their own ended, not yet reaped, child
         child = subprocess.Popen([sys.executable, "-c", "pass"])
         self.children.append(child)
-        for _ in range(200):
-            stat = Path(f"/proc/{child.pid}/stat").read_bytes()
-            if stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3] == b"Z":
+        for _ in range(500):
+            if coli._proc_state(child.pid) == "Z":
                 break
             time.sleep(0.01)
+        self.assertEqual(coli._proc_state(child.pid), "Z", "the ended child's state could not be read")
         self.assertFalse(coli._pid_alive(child.pid), "an exited child not yet reaped counted as running")
+        self.assertTrue(coli._pid_alive(os.getpid()), "this very process counted as gone")
 
 
 if __name__ == "__main__":
