@@ -739,6 +739,10 @@ VK_SPV   += shaders/chain_gemv2.spv
 VK_SPV   += shaders/chain_dsv4.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
+# the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
+VK_SPV   += shaders/chain_route.spv
+# the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
+VK_SPV   += shaders/chain_moe.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv

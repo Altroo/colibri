@@ -266,6 +266,13 @@ int  coli_vk_xb_queue_shared(void);   /* 1 = the batch shares the main queue */
 ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *gate, ColiVkTensor *up, ColiVkTensor *down);
 /* Its sets and its three tensors. Not while a batch is in flight. */
 void coli_vk_xb_expert_free(ColiVkExpert *e);
+/* Its entry in the expert table the dense chain reads (vk_chain.h, vkc_moe), the
+ * COLI_VK_XB_ENTRY words of chain_moe.comp: [0..1] gate's rows by device address, [2..3]
+ * its scales, [4..7] up's, [8..11] down's, [12..14] gate and up's fmt, row words and gs,
+ * [15..17] down's, [18] 1, the rest 0. 0 (nothing written) when the device cannot read
+ * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
+#define COLI_VK_XB_ENTRY 32
+int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);
 /* Submit and return: count experts, rows[c] activation rows each, the rows given as
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */
@@ -436,6 +443,7 @@ typedef struct {
     int has_prio, integrated, shares_ram;
     int coop_sg;                          /* subgroup size the cooperative-matrix shaders run at; 0 = none */
     int pin_sg;                           /* the subgroup size every chain pipeline requires; 0 = the driver's */
+    int bda;                              /* bufferDeviceAddress on: the chain reads the tier's experts by address */
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
