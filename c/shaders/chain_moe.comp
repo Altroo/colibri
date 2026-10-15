@@ -305,15 +305,18 @@ void main() {
                 block(WRef4(addr(eb + 8u)), SRef(addr(eb + 10u)), fmt, uint(rws), uint(gs), uint(O), o0, qbase, remaining, RW, rg, jj, lpr, W4, ag);
             }
             [[unroll]] for (uint r = 0u; r < RPS; r++) {
-                uint q = qbase + r * rg, o = o0 + q;
+                uint q = qbase + r * rg, o = o0 + q, oc = min(o, uint(O) - 1u);
                 bool writer = jj == 0u && r * rg < remaining && q < RW && o < uint(O);
                 float g = red(ag[r], lpr), u = p.mode == 0 ? red(au[r], lpr) : 0.0;
                 if (!writer) continue;
+                // the row scale at oc: the lanes `continue` left still load (o past the
+                // matrix there; a read past the scales, of the process's memory on a
+                // software device, crashed when it crossed into an unmapped page)
                 if (p.mode == 0) {
-                    if (fmt == 1 || fmt == 2) { g *= SRef(addr(eb + 2u)).v[o]; u *= SRef(addr(eb + 6u)).v[o]; }
+                    if (fmt == 1 || fmt == 2) { g *= SRef(addr(eb + 2u)).v[oc]; u *= SRef(addr(eb + 6u)).v[oc]; }
                     hid[j * p.I + int(o)] = act(g, u);
                 } else {
-                    if (fmt == 1 || fmt == 2) g *= SRef(addr(eb + 10u)).v[o];
+                    if (fmt == 1 || fmt == 2) g *= SRef(addr(eb + 10u)).v[oc];
                     hid[yko + j * p.D + int(o)] = g;
                 }
             }

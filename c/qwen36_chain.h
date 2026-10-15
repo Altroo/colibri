@@ -932,6 +932,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && vkc_begin();
+                /* the host's step ran the tier: the table again before a layer reads it */
+                if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);
             } else if (ok) {
                 ok = q36c_shared(ch, m, l, i, n);
                 /* A dense backbone has no expert readback to end the frame.

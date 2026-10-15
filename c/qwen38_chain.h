@@ -1131,6 +1131,8 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
             ch->host_ms += (now_s() - t1) * 1e3;
             ok = ok && vkc_begin();
+            /* the host's step ran the tier: the table again before a layer reads it */
+            if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);
             pending = 1;
         }
         if (ok) ok = q38c_moe_apply(ch, m, n, prev_dev ? ch->dm.y : ch->routed);

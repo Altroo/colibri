@@ -1541,7 +1541,8 @@ static float moe_e4m3(unsigned b) {
 }
 static float moe_w(int fmt, const uint8_t *row, const float *sc, int o, int i, int I, int gs) {
     static const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    int ng = gs > 0 ? (I + gs - 1) / gs : 0, nib = (row[i / 2] >> (4 * (i & 1))) & 15;
+    int ng = gs > 0 ? (I + gs - 1) / gs : 0;
+    int nib = fmt == 2 || fmt == 4 || fmt == 7 ? (row[i / 2] >> (4 * (i & 1))) & 15 : 0;   /* the int4 kinds' only */
     float f; uint32_t u;
     switch (fmt) {
     case 1:  return (float)(int8_t)row[i] * sc[o];

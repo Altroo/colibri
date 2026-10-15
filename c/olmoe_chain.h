@@ -591,6 +591,8 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                 if (g_pilot >= 3 && i + 3 < c->n_layers) pilot_prefetch(m, i + 3, ch->xpost, n);
             }
             ok = vkc_begin();
+            /* the host's step ran the tier: the table again before a layer reads it */
+            if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);
         }
         if (ok) { VkcEw cb = {VKC_EW_COMBINE, n * D, D, 1, 1, 1, 0, 0, 0, 0, 0, 1.f};
                   ok = vkc_ew(ch->x, ch->x, prev_dev ? ch->dm.y : ch->routed, NULL, NULL, &cb); }

@@ -1778,8 +1778,8 @@ family_qwen_chain() {
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
-  lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
-  lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  DMOE=1 lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
@@ -1817,11 +1817,11 @@ family_qwen_chain() {
   dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
     SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_late qwen38 "chain qwen38 device lost" 10 rebuild COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed \
+  lost_late qwen38 "chain qwen38 device lost" 10 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed \
     SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
-  lost_late qwen38 "chain qwen38 device lost, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_late qwen38 "chain qwen38 device lost in a verify, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost in a verify, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
     Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
   # the same last logits from every expert path, and the balancer moves experts between
@@ -1948,13 +1948,13 @@ family_qwen_spec() {
       echo "OK spec colibri lookup ${e:-gated} ${v:-CPU}: oracle and DRAFT=0's tokens, $(grep -o 'acceptance [^|]*' vk.log | head -1)"
     done
   done
-  lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows" 15 rebuild COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 Q38_MTP=1 \
+  lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
     Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
-  lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies" 20 rebuild COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 COLI_LOOKUP=1 \
+  lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies" 20 rebuild COLI_DENSE_I8=0 COLI_LOOKUP=1 \
     COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
-  lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows, the routed experts in the frame" 3 rebuild \
+  DMOE=1 lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows, the routed experts in the frame" 3 rebuild \
     OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
-  lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies, the routed experts in the frame" 3 rebuild \
+  DMOE=1 lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies, the routed experts in the frame" 3 rebuild \
     COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
 }
 # The same under ASan and UBSan: every run of the harness's quick subset (depth 3
@@ -2087,10 +2087,12 @@ lost_gate_redo() {  # <engine> <tag> <frame> <env...> -- <argv...>
 
 # The device lost `back` frames before the end of a run (a probe run counts the frames,
 # so the fault lands mid-decode on any device, whatever its setup submits): lost_gate
-# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there).
+# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there). The frames
+# counted are a step's on the host's routing (COLI_VK_CHAIN_MOE=0); DMOE=1 keeps the
+# routed experts in the frame, a step one frame (vk_dmoe.h).
 lost_late() {  # <engine> <tag> <frames back> rebuild|redo <env...> -- <argv...>
   local eng=$1 tag=$2 back=$3 kind=$4; shift 4
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
   local f; f=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
   { [ -n "$f" ] && [ "$f" -gt "$back" ]; } || { cat vk.log; fail "$tag: the probe run reports no frames"; }
@@ -2151,8 +2153,8 @@ family_inkling_olmoe_chain() {
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
   dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
-  lost_late olmoe "chain olmoe device lost mid-decode" 7 redo COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
-  lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  DMOE=1 lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
   # a bf16 or f16 checkpoint's dense matrices go up as bf16 (fmt 11) or f16 (fmt 14): the
   # CPU's tokens in about half the device bytes of the f32 snapshot's, with the host
   # copies kept or dropped
@@ -2167,7 +2169,7 @@ family_inkling_olmoe_chain() {
     echo "OK chain olmoe $half dense: $mb MiB resident against $mf MiB as f32"
     chain_gate olmoe "chain olmoe $half dense on the device only" 1 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_${half}_c -- 8 8 $OR
   done
-  lost_late olmoe "chain olmoe bf16 dense on the device only, device lost mid-decode" 7 redo COLI_VK_CHAIN_MOE=0 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
+  lost_late olmoe "chain olmoe bf16 dense on the device only, device lost mid-decode" 7 redo COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
 
   # serve: a session of pins, prompt-cache extensions, a divergent prompt and logprobs
   # against the CPU's, frame by frame (and with prompts only); the prefix-reuse and
@@ -3132,9 +3134,9 @@ dho_gate() {
 # dho_lost <engine> <tag> <frames back> <env...> -- <argv...>: device only, the device lost
 # `back` frames before the end of a run (COLI_VK_CHAIN_FAULT, counted on a probe run): the
 # CPU's tokens, and the matrices the CPU then needed read back from disk.
-dho_lost() {
+dho_lost() {   # the host's routing, as lost_late (DMOE=1: the routed experts in the frame)
   local eng=$1 tag=$2 back=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0)
   rm -f chain.usage
   env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true

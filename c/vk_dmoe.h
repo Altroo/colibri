@@ -18,10 +18,18 @@
  *
  *   VkcDmoe d = {0};
  *   if (vkc_dmoe_prepare(&d, lo, L, E, K, D, I, rows)) ...      once per step
- *   vkc_dmoe_upload(&d)                                          in the step's first frame
+ *   vkc_dmoe_upload(&d)                                          in every frame the step begins
  *   if (vkc_dmoe_on(&d, i)) vkc_dmoe_layer(&d, i, n, lg, bias, h2, &route, &moe)
  *                                                                then d.y holds the routed sum
  *   after the frame: vkc_dmoe_ids(&d, i) for each such layer
+ *
+ * The table holds device addresses of the tier's experts. A layer the host steps through
+ * (it holds only part of its experts) runs the tier, which may evict and free experts and
+ * upload others; a frame that read the table from before would read freed memory (on a
+ * software device, the process's own: a crash, wrong tokens, a stalled frame). So every
+ * frame the step begins, the first one and each after a host layer, calls
+ * vkc_dmoe_upload, which reads the table again when the tier's residents changed
+ * (vkt_epoch), and vkc_dmoe_on turns a layer down while its table is not the current one.
  *
  * COLI_VK_CHAIN_MOE=0 turns it off for every engine. */
 #ifndef COLI_VK_DMOE_H
@@ -49,6 +57,21 @@ static int vkc_dmoe_wanted(void) {
     return on;
 }
 
+/* The tier's table for layers lo..lo+L-1, read again when its residents changed since. */
+static int vkc_dmoe_read(VkcDmoe *d) {
+    if (d->read && d->epoch == vkt_epoch()) return 1;
+    int L = d->L, E = d->E;
+    if (!d->on) d->on = calloc((size_t)L, 1);
+    if (!d->tabh) d->tabh = malloc((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+    if (!d->on || !d->tabh) { d->off = 1; return 0; }
+    for (int i = 0; i < L; i++) {
+        int n = vkt_dev_table(d->lo + i, d->tabh + (size_t)i * E * COLI_VK_XB_ENTRY);
+        if (n < 0) { d->off = 1; return 0; }
+        d->on[i] = n == E;
+    }
+    d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
+    return 1;
+}
 /* For a step of `rows` rows on the primary device: whether any of layers lo..lo+L-1 takes
  * it; reads the tier's table again when its residents changed. 0 for good when the
  * device cannot read the tier's experts by address. */
@@ -57,17 +80,7 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
         !vkc_moe_ready() || !vkc_route_ready() || K < 1 || K > VKC_ROUTE_KMAX || E < K || E > VKC_ROUTE_EMAX) return 0;
     if (d->on && (d->lo != lo || d->L != L || d->E != E || d->K != K)) { d->off = 1; return 0; }
     d->lo = lo; d->L = L; d->E = E; d->K = K;
-    if (!d->read || d->epoch != vkt_epoch()) {
-        if (!d->on) d->on = calloc((size_t)L, 1);
-        if (!d->tabh) d->tabh = malloc((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
-        if (!d->on || !d->tabh) { d->off = 1; return 0; }
-        for (int i = 0; i < L; i++) {
-            int n = vkt_dev_table(lo + i, d->tabh + (size_t)i * E * COLI_VK_XB_ENTRY);
-            if (n < 0) { d->off = 1; return 0; }
-            d->on[i] = n == E;
-        }
-        d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
-    }
+    if (!vkc_dmoe_read(d)) return 0;
     int any = 0;
     for (int i = 0; i < L; i++) any |= d->on[i];
     if (!any) return 0;
@@ -80,15 +93,21 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     }
     return 1;
 }
-/* The table into the device, in the frame just begun, when it changed. */
+/* The table into the device, in a frame just begun: read again first when the tier's
+ * residents changed since (a host layer before it ran the tier), written when it changed.
+ * 0 only when the write fails; a table that cannot be read turns the layers down. */
 static int vkc_dmoe_upload(VkcDmoe *d) {
+    if (d->off || !d->tab) return 1;
+    if (!vkc_dmoe_read(d)) return 1;   /* d->off: every layer takes the host's step from here */
     if (!d->dirty) return 1;
     if (!vkc_write(d->tab, 0, d->tabh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t))) return 0;
     d->dirty = 0;
     return 1;
 }
+/* Whether layer `layer` runs its experts in the frame: all of them on the device, in the
+ * table the frame has (the tier's residents unchanged since it was read). */
 static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
-    return d->on && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo];
+    return d->on && !d->off && d->epoch == vkt_epoch() && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo];
 }
 /* Layer `layer` for n rows: route the logits lg (n rows of E from 0, bias as rt's
  * has_bias says) and run the experts on x (n rows of D from 0) into d->y. rt gives the
