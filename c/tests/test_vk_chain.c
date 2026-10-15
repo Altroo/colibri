@@ -62,6 +62,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <time.h>
 #include "../backend_vulkan.h"
 #include "../vk_chain.h"
 #include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
@@ -1637,8 +1638,17 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
     VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
     VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow};
+    /* the route and the experts in frames of their own, timed: a frame past the fence
+     * wait's 20 s loses the device, and the line says which of the two took the time */
+    struct timespec ts0, ts1, ts2;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
     int rec = vkc_begin() && vkc_write(tb, 0, tab, (size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4) &&
-              vkc_route(lb, NULL, ib, wb, &rp) && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+              vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    rec = rec && vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
+    double tr = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9, tm = (ts2.tv_sec - ts1.tv_sec) + (ts2.tv_nsec - ts1.tv_nsec) * 1e-9;
+    if (tr + tm > 1.0) fprintf(stderr, "[test] moe %s: the route frame %.1f s, the experts' frame %.1f s\n", what, tr, tm);
     float *got = down(yb, 0, (size_t)S * yrow);
     double e = 0;
     for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e) e = r; }
@@ -2765,6 +2775,15 @@ static void test_gemv_rows(int fmt, int S, int I, int O) {
 }
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
+    {   /* the CPU a software device runs on (llvmpipe compiles for it): CI runners differ */
+        FILE *ci = fopen("/proc/cpuinfo", "r"); char line[512], model[256] = ""; int avx512 = 0, n = 0;
+        while (ci && fgets(line, sizeof line, ci)) {
+            if (!strncmp(line, "model name", 10) && !model[0]) { char *c = strchr(line, ':'); if (c) snprintf(model, sizeof model, "%s", c + 2); n++; }
+            else if (!strncmp(line, "model name", 10)) n++;
+            if (!strncmp(line, "flags", 5) && strstr(line, " avx512f")) avx512 = 1;
+        }
+        if (ci) { fclose(ci); model[strcspn(model, "\n")] = 0; fprintf(stderr, "[test] CPU: %s, %d threads, AVX-512 %s\n", model, n, avx512 ? "yes" : "no"); }
+    }
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     if (!vkc_init()) { printf("FAIL: the chain's pipelines did not come up\n"); return 1; }
     if (getenv("COLI_VK_CHAIN_BENCH")) { bench_gemv(); vkc_shutdown(); coli_vk_shutdown(); return 0; }

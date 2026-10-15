@@ -95,6 +95,7 @@ typedef struct {
     ColiVkCore core;
     VkDevice dev;
     VkQueue queue;
+    uint64_t fence_ns;                /* a frame's wait before the device counts as lost (vkc_init) */
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
@@ -352,6 +353,14 @@ int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
     KC.dev = (VkDevice)KC.core.device; KC.queue = (VkQueue)KC.core.queue;
+    /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
+     * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
+     * empty cache chain_moe's first frame took more than 20 s (4 s on a laptop), and the
+     * device was given up for a compile. There a frame waits up to 5 minutes. */
+    {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        KC.fence_ns = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 300000000000ULL : 20000000000ULL;
+    }
     KC.align = KC.core.ssbo_align > 16 ? KC.core.ssbo_align : 16;
     VkDescriptorSetLayoutBinding b[VKC_BIND];
     for (int i = 0; i < VKC_BIND; i++) b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i,
@@ -423,7 +432,10 @@ int vkc_init(void) {
         if (xs > 8192) xs = 8192;
         VkSpecializationMapEntry me = {0, 0, 4};
         VkSpecializationInfo si = {1, &me, 4, &xs};
+        double t0 = vkc_now_ms();
         if (xs >= 1024) KC.moe = make_pipe(KC.mod_moe, &si);
+        double dt = vkc_now_ms() - t0;
+        if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv took %.1f s to build\n", dt / 1e3);
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -533,7 +545,7 @@ static int frame_wait(VkcFrame *f) {
     VkResult r = VK_NOT_READY;
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
         r = vkGetFenceStatus(KC.dev, f->fence);
-    if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, 20000000000ULL);
+    if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
     KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
