@@ -544,6 +544,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
+TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -2653,6 +2655,17 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 # engine's recycled slot, promotion decided when the bytes pass by.
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
+# mode, the engine's planar int4 staged as the container's pairs, hits keeping
+# residents warm, the trunk-only cases, and cap == n_experts as before.
+tests/test_qwen36_tier_stream$(EXE): tests/test_qwen36_tier_stream.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The qwen36 engine on the fake tier over the int4 gs64 fixture, at a cap below,
+# at and above n_experts: its last logits against the CPU build's (ci.yml).
+tests/test_qwen36_tier_stream_engine$(EXE): tests/test_qwen36_tier_stream_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Failed gate/up/down uploads must release every unpublished CUDA tensor.
 tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c qwen36_tier.c
