@@ -998,6 +998,13 @@ jobs:
             echo "kernel=$k: identical logits at cap 1/2/8/16"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
+          # The same kernel under the CUDA expert tier (fake backend, #2090): below
+          # (2), at (8) and above (16) the fixture's 8 experts, the last logits
+          # equal the CPU build's above.
+          make tests/test_qwen36_tier_stream_engine
+          for cap in 2 8 16; do
+            ./tests/test_qwen36_tier_stream_engine $cap qwen36_tiny64_c logits_${cap}_1.f32 qwen36_tiny64/ref_full.json
+          done
       - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
         run: |
           cd c
@@ -1020,9 +1027,10 @@ jobs:
           done
           cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
           echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
-          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          # COLI_CUDA=1 on a mixed container says with a line that the routed experts
+          # stay on the CPU (a CUDA build still places the dense trunk, #2090)
           COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
-          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
+          grep -q "COLI_CUDA=1: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: the line for the mixed layout under COLI_CUDA=1 is missing"; cat mixed_cuda.log; exit 1; }
       - name: Pinned experts and PILOT prefetch never change the logits (int4 gs64 fixture)
         run: |
           cd c
