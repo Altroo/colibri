@@ -164,7 +164,7 @@ on the 35B, three times what the routed experts read.
 
 Since 1.12.1 the activation is quantized to int8 once per call (one scale,
 amax/127, the same contract the expert integer kernels use) and the products
-are integer: 32 weights per instruction on AVX2, 64 on AVX-512 VNNI, exact
+are integer: 16 weights per instruction on SSSE3 (maddubs + madd pairs), 32 on AVX2, 64 on AVX-512 VNNI, exact
 int32 sums scaled once per output. The routed experts take the same path for
 their activations. Measured on Qwen3.6-35B-A3B, 8 threads, 300 decoded
 tokens, every expert resident, perplexity on 4 x 512 tokens of English text:
