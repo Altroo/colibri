@@ -666,6 +666,9 @@ typedef struct ColiDeepSeekV4ExpertStoreOptions {
     /* Internal range executors must not benchmark arbitrary bytes from a
      * complete checkpoint while opening one layer slice. */
     int skip_mirror_setup;
+    /* The RAM the plan keeps for the system: filling the cache before the first
+     * request stops short of taking free memory below it (0: no such check). */
+    uint64_t keep_free_bytes;
 } ColiDeepSeekV4ExpertStoreOptions;
 
 int coli_deepseek_v4_expert_store_open(
@@ -673,6 +676,10 @@ int coli_deepseek_v4_expert_store_open(
     ColiExpertStore **store,
     char *error,
     size_t error_size);
+/* Reads into the cache, before the first request, every expert its slots hold, or
+ * with fewer slots each layer's most used ones in the history (#2109). Counts no
+ * use; runs once per store. Returns the experts it could not read. */
+int coli_v4_expert_store_prewarm(ColiExpertStore *store);
 
 /* Plain SSD implementation underneath the optional hot-row/autopin wrapper.
  * Segment adapters use it so opening a layer range never warms experts from

@@ -1676,6 +1676,7 @@ int coli_v4_expert_store_open_planned(
     automatic.cache_bytes = plan.expert_cache_bytes;
     automatic.pin_slots_per_layer = runtime->pin_slots_per_layer;
     automatic.repin_interval = runtime->repin_interval;
+    automatic.keep_free_bytes = plan.system_reserve_bytes;
     return coli_deepseek_v4_expert_store_open(
         &automatic, output, error, error_size);
 }
@@ -8979,6 +8980,10 @@ typedef struct V4HotPolicy {
     uint64_t history_total;
     int history_seeded;
     char *history_path;
+    /* warming: the cache is being filled before the first request, and a lookup
+     * counts nothing (history, heat, hit rate); prewarmed: that fill is done. */
+    int warming, prewarmed;
+    uint64_t keep_free;   /* options->keep_free_bytes */
     struct V4HotPolicy *next;
 } V4HotPolicy;
 
@@ -9558,6 +9563,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         return -1;
     }
     pthread_mutex_lock(&state->mutex);
+    if (!policy->warming) {   /* the fill before the first request is not a use */
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
     if (state->ehit) {
@@ -9581,6 +9587,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
         hot_repin_locked(policy, state, key.layer);
+    }
 
     V4ExpertSlot *slot;
 retry_lookup:
@@ -9861,51 +9868,123 @@ static void destroy_hot(ColiExpertStore *store) {
     destroy(store);
 }
 
-static int hot_prewarm_history(V4HotPolicy *policy,
-                               V4ExpertStoreState *state) {
-    if (!policy || !state || !policy->history_seeded ||
-        policy->pin_count < 1) return 0;
-    size_t capacity = (size_t)state->layers * policy->pin_count;
-    ColiExpertKey *keys = malloc(capacity * sizeof(*keys));
-    if (!keys) return -1;
-    size_t count = 0;
-    for (int layer = 0; layer < state->layers; layer++) {
-        hot_repin_locked(policy, state, layer);
-        const int *pins = policy->pins + (size_t)layer * policy->pin_count;
-        for (int rank = 0; rank < policy->pin_count; rank++)
-            if (pins[rank] >= 0)
-                keys[count++] = (ColiExpertKey){layer, pins[rank]};
+/* Fill the expert cache before the first request (#2109). Left alone it starts
+ * empty and fills one miss at a time, each read waiting on the token that needs
+ * it: on a 256 GB machine whose plan holds every expert, DeepSeek-V4-Flash
+ * decoded 1 tok/s at first and 3 after 700 tokens, its cache at 105 of ~137 GiB.
+ *
+ * It fills only the slots the RAM plan already gave the cache, as a long session
+ * would, and touches neither the dense placement nor a device tier. When the
+ * slots hold every expert, all are read; otherwise each layer's most used ones in
+ * the saved history, up to its slots (none without a history: nothing says which).
+ * The reads run in parallel, one expert per thread, with a progress line every 10%
+ * or 15 s when there is a GiB or more to read. The lookups count nothing (policy->warming): the history, heat and hit
+ * rate see only requests. Returns the experts that could not be read; they load
+ * when first used, as before. */
+int coli_v4_expert_store_prewarm(ColiExpertStore *store) {
+    if (!store || !store->state) return 0;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy || policy->prewarmed) return 0;
+    policy->prewarmed = 1;
+    V4ExpertStoreState *state = store->state;
+    int layers = state->layers, experts = state->experts_per_layer;
+    int per_layer = state->slots_per_layer < experts
+        ? state->slots_per_layer : experts;
+    int every = per_layer >= experts;
+    if (!every && !policy->history_total) {
+        fprintf(stderr, "[v4] expert cache: %d of %d experts per layer fit and no "
+                "usage history says which, so it fills as experts are used\n",
+                per_layer, experts);
+        return 0;
     }
-
-    double began = hot_now();
-    int warmed = 0;
-    uint64_t repin_interval = policy->repin_interval;
-    policy->repin_interval = 0;
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:warmed)
-    for (size_t i = 0; i < count; i++) {
-        ColiExpertView view;
-        if (!lookup_hot(policy->store, keys[i], &view)) {
-            release(policy->store, &view);
-            warmed++;
+    ColiExpertKey *keys = malloc((size_t)layers * per_layer * sizeof(*keys));
+    int *order = every ? NULL : malloc((size_t)experts * sizeof(*order));
+    if (!keys || (!every && !order)) { free(keys); free(order); return -1; }
+    size_t count = 0;
+    for (int layer = 0; layer < layers; layer++) {
+        if (every) {
+            for (int expert = 0; expert < experts; expert++)
+                keys[count++] = (ColiExpertKey){layer, expert};
+            continue;
+        }
+        /* the per_layer most selected, ties to the lower id; never selected ones stay out */
+        const uint64_t *use = policy->usage + (size_t)layer * experts;
+        for (int expert = 0; expert < experts; expert++) order[expert] = expert;
+        for (int rank = 0; rank < per_layer; rank++) {
+            int best = rank;
+            for (int j = rank + 1; j < experts; j++)
+                if (use[order[j]] > use[order[best]]) best = j;
+            int chosen = order[best]; order[best] = order[rank]; order[rank] = chosen;
+            if (!use[chosen]) break;
+            keys[count++] = (ColiExpertKey){layer, chosen};
         }
     }
-    policy->repin_interval = repin_interval;
+    free(order);
+    if (!count) { free(keys); return 0; }
+    double total_gib = (double)count * state->record_bytes / 1073741824.0;
+    fprintf(stderr, "[v4] expert cache: reading %s (%zu experts, %.1f GiB) before "
+            "the first request; COLI_V4_PREWARM=0 starts with it empty\n",
+            every ? "every expert" : "each layer's most used experts",
+            count, total_gib);
+
+    pthread_mutex_lock(&state->mutex);
+    ColiExpertStoreStats before = state->stats;
+    double disk_before = state->disk_sec;
+    pthread_mutex_unlock(&state->mutex);
+    double began = hot_now(), next_line = began + 15.0;
+    size_t done = 0;
+    int failed = 0, tenth = 1, short_of_ram = 0;
+    policy->warming = 1;
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:failed)
+    for (size_t i = 0; i < count; i++) {
+        if (__atomic_load_n(&short_of_ram, __ATOMIC_RELAXED)) continue;
+        ColiExpertView view;
+        if (lookup_hot(store, keys[i], &view)) { failed++; continue; }
+        release(store, &view);
+        #pragma omp critical(v4_prewarm_progress)
+        {
+            done++;
+            /* What the plan expects can still be wrong (a GPU that shares the
+             * RAM, another process): the fill never takes the system's share. */
+            if (policy->keep_free && coli_v4_os_available_memory() <
+                    policy->keep_free + state->record_bytes)
+                __atomic_store_n(&short_of_ram, 1, __ATOMIC_RELAXED);
+            double now = hot_now();
+            if (total_gib >= 1.0 && done < count &&
+                (done * 10 >= (size_t)tenth * count || now >= next_line)) {
+                double gib = (double)done * state->record_bytes / 1073741824.0;
+                double rate = gib / (now - began > 1e-9 ? now - began : 1e-9);
+                fprintf(stderr, "[v4] expert cache: %.1f of %.1f GiB (%d%%), %.2f GiB/s, "
+                        "about %.0f s left\n", gib, total_gib, (int)(done * 100 / count),
+                        rate, (total_gib - gib) / (rate > 1e-9 ? rate : 1e-9));
+                while ((size_t)tenth * count <= done * 10) tenth++;
+                next_line = now + 15.0;
+            }
+        }
+    }
+    policy->warming = 0;
     free(keys);
 
-    /* Warmup traffic must not dilute request hit-rate telemetry. */
     pthread_mutex_lock(&state->mutex);
     uint64_t resident = state->stats.resident_bytes;
-    uint64_t capacity_bytes = state->stats.capacity_bytes;
-    memset(&state->stats, 0, sizeof(state->stats));
+    state->stats = before;
     state->stats.resident_bytes = resident;
-    state->stats.capacity_bytes = capacity_bytes;
-    memset(policy->layer_requests, 0,
-           (size_t)state->layers * sizeof(*policy->layer_requests));
+    state->disk_sec = disk_before;
     pthread_mutex_unlock(&state->mutex);
-    fprintf(stderr,
-            "v4_autopin warmed=%d requested=%zu bytes=%.3fGiB time=%.3fs\n",
-            warmed, count, resident / 1073741824.0, hot_now() - began);
-    return warmed == (int)count ? 0 : -1;
+    double seconds = hot_now() - began;
+    fprintf(stderr, "[v4] expert cache: %zu experts, %.1f GiB, read in %.1f s (%.2f GiB/s)\n",
+            done, (double)resident / 1073741824.0, seconds,
+            seconds > 1e-9 ? (double)done * state->record_bytes / 1073741824.0 / seconds
+                           : 0.0);
+    if (short_of_ram)
+        fprintf(stderr, "[v4] expert cache: stopped with %zu experts left, free RAM "
+                "reached the %.1f GiB the plan keeps for the system; each loads when "
+                "it is first used\n", count - done - (size_t)failed,
+                policy->keep_free / 1073741824.0);
+    if (failed)
+        fprintf(stderr, "[v4] expert cache: %d experts could not be read now; each "
+                "loads when it is first used\n", failed);
+    return failed;
 }
 
 #ifndef COLI_V4_ROWS16_STORE_OPEN
@@ -9962,6 +10041,7 @@ int COLI_V4_ROWS16_STORE_OPEN(
     }
     for (size_t i = 0; i < pins; i++) policy->pins[i] = -1;
     policy->store = *output; policy->pin_count = pin_count;
+    policy->keep_free = options->keep_free_bytes;
     policy->history_path = hot_history_path(options->model_dir);
     policy->repin_interval = options->repin_interval
         ? options->repin_interval : (uint64_t)minimum_slots;
@@ -9989,10 +10069,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
             "v4_hot_policy pin_slots_per_layer=%d repin_interval=%llu "
             "mode=resident-ram rows16=hot-pins\n", pin_count,
             (unsigned long long)policy->repin_interval);
+    /* COLI_V4_PREWARM=1 fills the cache here, in any run; unset, a serve fills it
+     * before READY (v4_serve_main) and a one-shot run leaves it to the misses. */
     const char *prewarm = getenv("COLI_V4_PREWARM");
-    if (policy->history_seeded && prewarm && atoi(prewarm) != 0 &&
-        hot_prewarm_history(policy, state))
-        fprintf(stderr, "v4_autopin warning=partial-warmup; continuing\n");
+    if (prewarm && atoi(prewarm) != 0 && !options->skip_mirror_setup)
+        coli_v4_expert_store_prewarm(*output);
     return 0;
 }
 
@@ -10833,7 +10914,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
                 4ULL << 30,
                 engine->runtime.pin_slots_per_layer,
                 engine->runtime.repin_interval,
-                0},
+                0, 0},
             &engine->experts, error, error_size))
         goto fail;
     engine->owns_experts = 1;
@@ -13726,7 +13807,7 @@ int main(int argc, char **argv) {
     }
     ColiDeepSeekV4ExpertStoreOptions store_opts = {
         argv[1], config.num_hidden_layers, config.n_routed_experts,
-        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0, 0,
+        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0, 0, 0,
     };
     /* Route through the pluggable backend registry when COLI_EXPERT_STORE names
      * a non-"auto" backend (e.g. a networked/remote store). The
@@ -16655,6 +16736,12 @@ static int v4_serve_main(void) {
             }
         }
     }
+    /* Every expert the RAM plan holds is read before READY (#2109), so the first
+     * request runs at the warm speed instead of filling the cache miss by miss.
+     * COLI_V4_PREWARM=0 skips it (=1 already filled it when the store opened). */
+    const char *prewarm = getenv("COLI_V4_PREWARM");
+    if (!prewarm || atoi(prewarm) != 0)
+        coli_v4_expert_store_prewarm(engine->experts);
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout, v4_serve_rss_gb());
     v4_hwinfo_emit();

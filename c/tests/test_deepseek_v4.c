@@ -637,7 +637,7 @@ static int test_expert_store(void) {
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 7, 306, -1, 0, 0
+        directory, 1, 7, 306, -1, 0, 0, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -837,7 +837,7 @@ static int test_expert_store_prefill_pool(void) {
     }
     ColiDeepSeekV4ExpertStoreOptions options = {
         directory, LAYERS, EXPERTS,
-        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX, 0
+        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX, 0, 0
     };
     /* Deterministic A/B.  With the ordinary six-slot partition, iterating an
      * eight-expert union in the same order twice is a cyclic 0%%-hit workload:
@@ -984,7 +984,7 @@ static int run_expert_miss_scaling_case(const char *directory, int experts,
                                         int slots) {
     char error[256];
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, experts, (uint64_t)slots * 51, -1, UINT64_MAX, 0
+        directory, 1, experts, (uint64_t)slots * 51, -1, UINT64_MAX, 0, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -1171,7 +1171,7 @@ static int test_expert_store_per_matrix_direct(void) {
     }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 2, 102, -1, 0, 0
+        directory, 1, 2, 102, -1, 0, 0, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -1220,6 +1220,188 @@ static int test_expert_store_per_matrix_direct(void) {
         return 1;
     }
     puts("DeepSeek-V4 ExpertStore per_matrix direct: ok");
+    return 0;
+}
+
+static int prewarm_resident(ColiExpertStore *store, int layers, int experts) {
+    int resident = 0;
+    for (int layer = 0; layer < layers; layer++)
+        for (int expert = 0; expert < experts; expert++)
+            if (coli_v4_test_expert_slot_index(
+                    store, (ColiExpertKey){layer, expert}) >= 0)
+                resident++;
+    return resident;
+}
+
+/* #2109: the cache filled before the first request. With slots for every expert,
+ * all are read and none counts as a request; with fewer, each layer's most used
+ * in the history and no never-used one, and the history saved afterwards is the
+ * one loaded; with less free RAM than the plan keeps for the system, the fill
+ * stops and the experts it left still load on use. */
+static int test_expert_store_prewarm(void) {
+    enum { LAYERS = 2, EXPERTS = 8, SLOTS = 6, WIDE = 64 };
+    char directory[] = "colibri-v4-prewarm-XXXXXX";
+    char path[256], history[300], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    unsetenv("COLI_V4_PREWARM");
+    if (!mkdtemp(directory)) { perror("mkdtemp prewarm"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    snprintf(history, sizeof(history), "%s/.coli_usage", directory);
+    if (write_fixture_layers(path, LAYERS, EXPERTS)) {
+        perror("write prewarm fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    ColiExpertStore *store = NULL;
+    ColiExpertStoreStats stats;
+
+    ColiDeepSeekV4ExpertStoreOptions every = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * EXPERTS * 51, -1, 0, 0, 0
+    };
+    if (coli_deepseek_v4_expert_store_open(&every, &store, error, sizeof(error))) {
+        fprintf(stderr, "prewarm store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    if (prewarm_resident(store, LAYERS, EXPERTS) != 0) {
+        fprintf(stderr, "prewarm: the store opened warm without being asked\n");
+        failed = 1;
+    }
+    if (coli_v4_expert_store_prewarm(store) != 0 ||
+        prewarm_resident(store, LAYERS, EXPERTS) != LAYERS * EXPERTS) {
+        fprintf(stderr, "prewarm: %d of %d experts resident\n",
+                prewarm_resident(store, LAYERS, EXPERTS), LAYERS * EXPERTS);
+        failed = 1;
+    }
+    store->ops->stats(store, &stats);
+    if (stats.requests || stats.hits || stats.misses || stats.bytes_read ||
+        stats.resident_bytes != (uint64_t)LAYERS * EXPERTS * 51) {
+        fprintf(stderr, "prewarm counted as use: requests=%llu hits=%llu misses=%llu "
+                "bytes=%llu resident=%llu\n",
+                (unsigned long long)stats.requests, (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses, (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes);
+        failed = 1;
+    }
+    for (int layer = 0; layer < LAYERS && !failed; layer++)
+        for (int expert = 0; expert < EXPERTS && !failed; expert++)
+            if (lookup_fixture_at(store, layer, expert, EXPERTS)) failed = 1;
+    /* a second fill is a no-op */
+    if (!failed && coli_v4_expert_store_prewarm(store) != 0) failed = 1;
+    store->ops->stats(store, &stats);
+    if (!failed && (stats.requests != LAYERS * EXPERTS ||
+                    stats.hits != LAYERS * EXPERTS || stats.misses || stats.bytes_read)) {
+        fprintf(stderr, "after prewarm: requests=%llu hits=%llu misses=%llu bytes=%llu\n",
+                (unsigned long long)stats.requests, (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses, (unsigned long long)stats.bytes_read);
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    store = NULL;
+    if (failed) goto out;
+
+    /* six slots a layer: layer 0 has seven used experts (1 is the least), layer 1 two */
+    static const int used[][3] = {
+        {0, 7, 70}, {0, 6, 60}, {0, 5, 50}, {0, 4, 40}, {0, 3, 30}, {0, 2, 20},
+        {0, 1, 5}, {1, 3, 9}, {1, 0, 4},
+    };
+    enum { USED = (int)(sizeof(used) / sizeof(used[0])) };
+    FILE *file = fopen(history, "w");
+    if (!file) { perror("prewarm history"); failed = 1; goto out; }
+    for (int i = 0; i < USED; i++)
+        fprintf(file, "%d %d %d\n", used[i][0], used[i][1], used[i][2]);
+    fclose(file);
+    setenv("COLI_V4_AUTOPIN", "1", 1);
+    setenv("COLI_V4_SAVE_USAGE", "1", 1);
+    ColiDeepSeekV4ExpertStoreOptions fewer = {
+        directory, LAYERS, EXPERTS, (uint64_t)LAYERS * SLOTS * 51, -1, 0, 0, 0
+    };
+    if (coli_deepseek_v4_expert_store_open(&fewer, &store, error, sizeof(error))) {
+        fprintf(stderr, "prewarm history store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    coli_v4_expert_store_prewarm(store);
+    for (int layer = 0; layer < LAYERS; layer++)
+        for (int expert = 0; expert < EXPERTS; expert++) {
+            int want = layer == 0 ? expert >= 2 : (expert == 0 || expert == 3);
+            int have = coli_v4_test_expert_slot_index(
+                store, (ColiExpertKey){layer, expert}) >= 0;
+            if (have != want) {
+                fprintf(stderr, "prewarm from history: layer %d expert %d %s\n", layer,
+                        expert, have ? "read but not among the most used"
+                                     : "among the most used but not read");
+                failed = 1;
+            }
+        }
+    store->ops->stats(store, &stats);
+    if (stats.requests || stats.bytes_read) failed = 1;
+    store->ops->destroy(store);   /* saves the history */
+    store = NULL;
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    file = fopen(history, "r");
+    int rows = 0;
+    if (file) {
+        int layer, expert;
+        unsigned count;
+        char line[128];
+        while (fgets(line, sizeof(line), file))
+            if (sscanf(line, "%d %d %u", &layer, &expert, &count) == 3 && layer >= 0) {
+                int known = 0;
+                for (int i = 0; i < USED; i++)
+                    if (used[i][0] == layer && used[i][1] == expert &&
+                        (unsigned)used[i][2] == count) known = 1;
+                if (!known) {
+                    fprintf(stderr, "prewarm changed the history: %s", line);
+                    failed = 1;
+                }
+                rows++;
+            }
+        fclose(file);
+    }
+    if (rows != USED) {
+        fprintf(stderr, "prewarm history saved %d rows of %d\n", rows, USED);
+        failed = 1;
+    }
+    unlink(history);
+    if (failed) goto out;
+
+    /* free RAM below what the plan keeps: the fill stops, the rest loads on use */
+    if (write_fixture_layers(path, LAYERS, WIDE)) {
+        perror("write wide prewarm fixture");
+        failed = 1;
+        goto out;
+    }
+    ColiDeepSeekV4ExpertStoreOptions short_of_ram = {
+        directory, LAYERS, WIDE, (uint64_t)LAYERS * WIDE * 51, -1, 0, 0,
+        (uint64_t)1 << 62
+    };
+    if (coli_deepseek_v4_expert_store_open(&short_of_ram, &store, error, sizeof(error))) {
+        fprintf(stderr, "prewarm wide store open failed: %s\n", error);
+        failed = 1;
+        goto out;
+    }
+    coli_v4_expert_store_prewarm(store);
+    int resident = prewarm_resident(store, LAYERS, WIDE);
+    if (resident < 1 || resident >= LAYERS * WIDE) {
+        fprintf(stderr, "prewarm short of RAM: %d of %d experts read, want some but "
+                "not all\n", resident, LAYERS * WIDE);
+        failed = 1;
+    }
+    for (int layer = 0; layer < LAYERS && !failed; layer++)
+        for (int expert = 0; expert < WIDE && !failed; expert++)
+            if (lookup_fixture_at(store, layer, expert, WIDE)) failed = 1;
+
+out:
+    if (store) store->ops->destroy(store);
+    unlink(history);
+    if (scratch_remove(directory, path)) return 1;
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore prewarm: ok");
     return 0;
 }
 /* ==== end test_deepseek_v4_expert_store.c ==== */
@@ -1811,6 +1993,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_per_matrix_direct() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_per_matrix_direct\n");
+        return 1;
+    }
+    if (test_expert_store_prewarm() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_prewarm\n");
         return 1;
     }
     if (test_kv_cache() != 0) {
