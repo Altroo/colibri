@@ -7249,13 +7249,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         raise ClientCancelled()
                     _, tail = score(prefix + " " + option, False)
                     rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                    if not rows:
+                        raise APIError(502, "The engine returned no log probabilities for an "
+                                            "option.", None, "engine_error", "server_error")
                     total = sum(e["logprob"] for e in rows)
                     count = max(len(rows), 1)
                     scored.append({"option": option, "logprob": total, "tokens": len(rows),
                                    "mean_logprob": total / count})
-                if not any(entry["tokens"] for entry in scored):
-                    raise APIError(502, "The engine returned no log probabilities for the "
-                                        "options.", None, "engine_error", "server_error")
                 key = "mean_logprob" if norm == "mean" else "logprob"
                 if norm == "mean":
                     token_counts = {entry["tokens"] for entry in scored if entry["tokens"]}
