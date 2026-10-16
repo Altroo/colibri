@@ -193,8 +193,10 @@ static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) 
 #if defined(__AVX2__) || !defined(OLMOE_NO_MAIN)
 static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up pair matmul
                                      * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
-                                     * matmul_q_idot_pair_v3). Exact integer arithmetic only —
-                                     * bit-identical to the stock matmul_q path; OFF by default. */
+                                     * matmul_q_idot_pair_v3). Bit-identical to matmul_q's IDOT=1
+                                     * branch, which quantizes the activations to Q8_0 and is therefore
+                                     * LOSSY against the default path. FUSED3 only takes effect together
+                                     * with IDOT=1 (see moe_fused3); OFF by default. */
 #endif
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
@@ -468,7 +470,7 @@ static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
 #endif
 
 #if defined(__AVX2__)
-#include "fused_simd.h"   /* FUSED3=1: quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3 (bit-exact) */
+#include "fused_simd.h"   /* FUSED3=1 (with IDOT=1): quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3, bit-identical to the IDOT branch */
 #endif
 
 #if defined(HAVE_FAST_DOT_I8)
@@ -1358,14 +1360,16 @@ static void moe_route_row(Model *m, int layer, int s, float *pr, int *idx, float
 }
 
 #if defined(__AVX2__)
-/* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
- * dims %16==0, <=4096) — outside it the stock calls run unchanged.
- * Exact integer arithmetic only: bit-identical output (verified by memcmp
- * in tests/bench_fused3.c). OFF by default. */
+/* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT=1, dims %16==0,
+ * <=4096) — outside it the stock calls run unchanged. The fused kernels are
+ * bit-identical to matmul_q's IDOT branch (memcmp in tests/bench_fused3.c), and
+ * that branch quantizes the activations to Q8_0, so it is lossy against the default
+ * path (#1044). The gate therefore follows matmul_q_idot() exactly: with IDOT unset
+ * the engine stays on the exact path whatever FUSED3 says. (It used to treat an
+ * unset IDOT as "on", so FUSED3=1 alone silently switched experts to the lossy path:
+ * a 96-token greedy run diverged from the default at character 257.) OFF by default. */
 static int moe_fused3(int D, int I) {
-    static int idot_moe = -1;
-    if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
-    return g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096;
+    return g_fused3 && matmul_q_idot() && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096;
 }
 #endif
 /* One routed expert on one row: hh[D] = down(silu(gate(xs)) * up(xs)); g, u are
