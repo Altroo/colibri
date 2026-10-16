@@ -1967,8 +1967,16 @@ def config_ready(cfg):
         return False
     if not os.path.isdir(cfg.get("model_dir") or ""):
         return False
-    if (cfg.get("model") or {}).get("repo") and not setup_download.is_complete(
+    model = cfg.get("model") or {}
+    if model.get("repo") and not setup_download.is_complete(
             cfg["model_dir"], extra_shard_dirs(cfg.get("family"), cfg.get("env"))):
+        return False
+    try:
+        entry = setup_catalog.by_id(model["id"]) if model.get("id") else None
+    except KeyError:
+        entry = None  # a local folder or a catalog entry no longer listed
+    if entry and any(not os.path.isfile(os.path.join(cfg["model_dir"], creates))
+                     for _, creates in entry.post_install):
         return False
     return os.path.isfile(cfg.get("engine") or "") and os.path.isfile(cfg.get("launcher") or "")
 
