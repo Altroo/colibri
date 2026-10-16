@@ -3346,28 +3346,44 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * resident at once: each is held (expert_hold) until the kernel is done with
  * it, so neither the run's next load nor the PILOT worker can evict it, and
  * the batch is cut to what the layer cache can hold:
- * the whole prompt chunk when cap covers S*K slots, one token when it covers
- * K, one (token, expert) pair otherwise (cap=1 in CI evicts on every routed
- * expert). out starts at zero (moe) and every cut adds into it through the
- * one xf_moe_add call below, val*expert in rank order, so the three cuts
- * produce the same bits. A pair run used to go through a zeroed buffer and a
- * second add: two roundings where the fused multiply-add of an FMA build
- * does one, and cap=1 moved the logits in their last bits. */
+ * as many rows as route to at most cap distinct experts when cap covers K
+ * (xf_rows_fit, up to QWEN_XF_ROWS rows), one (token, expert) pair otherwise
+ * (cap=1 in CI evicts on every routed expert). A run counted S*K slots before,
+ * one per pair, so a prompt longer than cap/K rows went one token at a time
+ * and read its K experts from DRAM for every row; the rows of a run that share
+ * an expert read it once per chunk. out starts at zero (moe) and every cut adds
+ * into it through the one xf_moe_add call below, val*expert in rank order, so
+ * every cut produces the same bits. A pair run used to go through a zeroed
+ * buffer and a second add: two roundings where the fused multiply-add of an
+ * FMA build does one, and cap=1 moved the logits in their last bits.
+ * A run is sized on the slots that are not pinned (every pinned slot counts as
+ * taken, whether or not the run routes to it), so the experts it holds are the
+ * most recently used ones and the next load evicts what a token-at-a-time pass
+ * would have evicted: the same loads, the same evictions, no pinned expert
+ * given up for a run. */
+#define QWEN_XF_ROWS 256   /* rows per run at most: about 31 MB of scratch on the 35B */
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int64_t gp = (int64_t)F * D / 2;
-    int per = cap >= S * K ? S : 1;           /* tokens per run */
     int kper = cap >= K ? K : 1;              /* experts per run */
-    int n = per * kper;
+    int room = cap;                           /* slots a run may fill */
+    if (S > 1 && kper == K) {
+        pthread_mutex_lock(&g_pilot_mx);
+        for (int i = 0; i < m->cache[layer].n; i++) room -= m->cache[layer].slots[i].pinned != 0;
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    int per_max = kper < K || room < K ? 1 : S < QWEN_XF_ROWS ? S : QWEN_XF_ROWS;   /* tokens per run, at most */
+    int n = per_max * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
     int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
     Slot **held = malloc(sizeof(Slot *) * (size_t)n);
-    void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
+    void *scratch = malloc(xf_moe_scratch_bytes(per_max, kper, D, F));
     if (!ex || !exp || !ridx || !held || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
-    for (int s0 = 0; s0 < S; s0 += per) {
+    for (int s0 = 0, per; s0 < S; s0 += per) {
+        per = per_max > 1 ? xf_rows_fit(idx, s0, S, K, room, per_max) : 1;
         for (int k0 = 0; k0 < K; k0 += kper) {
             double t0 = timed ? tm_now() : 0;
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
@@ -3382,7 +3398,7 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
             double t1 = timed ? tm_now() : 0;
             xf_moe_add(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, kper, D, F, ridx, rval, exp, xf_act_mode(), scratch);
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
-            for (int i = 0; i < n; i++) if (held[i]) slot_release(held[i]);
+            for (int i = 0; i < per * kper; i++) if (held[i]) slot_release(held[i]);
         }
     }
     free(ex); free(exp); free(ridx); free(rval); free(held); free(scratch);

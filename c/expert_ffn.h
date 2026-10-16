@@ -349,6 +349,32 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
          + n * sizeof(int) * 4 + 4096;
 }
 
+/* How many rows from s0 one run can take when the caller's cache holds `cap`
+ * experts at once: the longest stretch whose distinct experts number at most
+ * cap, at most `max` rows, never fewer than one (a caller whose cap is below K
+ * cuts that row into pairs itself). The rows of a run that share an expert read
+ * it once per chunk, so the cut decides how often a prompt reads its experts;
+ * the bits do not depend on it (xf_moe_add). An id of XF_FIT_IDS or more ends
+ * the run before its row. */
+#define XF_FIT_IDS 1024
+static inline int xf_rows_fit(const int *idx, int s0, int S, int K, int cap, int max) {
+    uint8_t seen[XF_FIT_IDS] = {0};
+    int distinct = 0, rows = 0;
+    for (; s0 + rows < S && rows < max; rows++) {
+        const int *r = idx + (size_t)(s0 + rows) * K;
+        int add = 0;
+        for (int k = 0; k < K; k++) {
+            int e = r[k];
+            if (e < 0) continue;
+            if (e >= XF_FIT_IDS) return rows > 0 ? rows : 1;
+            if (!seen[e]) { seen[e] = 1; add++; }
+        }
+        if (distinct + add > cap) break;
+        distinct += add;
+    }
+    return rows > 0 ? rows : 1;
+}
+
 /* The per-(s,k) expert outputs alone: ctb[(s*K+k)*H ..] = expert_k(x[s]) for every
  * pair with an expert, nothing summed. ctb may be the caller's (an engine that adds
  * other outputs in the same rank order, vk_tier.h) or NULL: then it is carved from
