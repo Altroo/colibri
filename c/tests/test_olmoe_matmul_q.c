@@ -165,6 +165,7 @@ int main(void) {
         failures++;
     }
 
+#if defined(__AVX2__)   /* moe_fused3 exists with the AVX2 kernels only */
     /* --- 5. FUSED3 must follow IDOT, never switch the lossy path on by itself --
      * FUSED3's kernels are bit-identical to the IDOT branch, i.e. lossy against the
      * default path. moe_fused3 used to read an unset IDOT as "on", so FUSED3=1 alone
@@ -185,6 +186,7 @@ int main(void) {
         failures++;
     }
     g_fused3 = 0;
+#endif
     matmul_q_reset_for_test();
 
     free(x); free(q); free(scale); free(y); free(ref);

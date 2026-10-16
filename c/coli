@@ -2169,7 +2169,9 @@ IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
 # da shlex, che in modalita' POSIX mangia le barre rovesciate e va in errore su
 # un apostrofo -- cioe' su una frase italiana su due.
 _ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
-_IMAGE_PATH_START = r"(?:[A-Za-z]:\\|~?/|\./)"
+# a drive with either slash (Python on MSYS2 and many Windows tools write C:/...), never a
+# letter inside a word ("Nota:/tmp/x.png" is /tmp/x.png)
+_IMAGE_PATH_START = r"(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/]|~?/|\./)"
 IMAGE_PATH = re.compile(
     r'"' + _IMAGE_PATH_START + r'[^"\n]*\.(?:' + _ESTENSIONI + r')"'
     + r"|'" + _IMAGE_PATH_START + r"[^'\n]*\.(?:" + _ESTENSIONI + r")'"
@@ -2183,7 +2185,7 @@ def to_local_path(token):
     Un percorso Windows incollato da Esplora risorse dentro WSL indica un file
     che da qui si chiama /mnt/<lettera>/...: senza tradurlo non esiste."""
     token = token.strip().strip('"').strip("'")
-    if re.fullmatch(r"[A-Za-z]:\\.*", token, re.S):
+    if re.fullmatch(r"[A-Za-z]:[\\/].*", token, re.S):
         if sys.platform == "win32":
             return token
         return f"/mnt/{token[0].lower()}/" + token[2:].replace("\\", "/").lstrip("/")
