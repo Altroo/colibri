@@ -2882,7 +2882,7 @@ tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_matmul_f16$(EXE): tests/test_matmul_f16.c matmul_f16.h matmul_f32.h
+tests/test_matmul_f16$(EXE): tests/test_matmul_f16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
