@@ -373,13 +373,17 @@ class DiagnosticHarness:
             text, method = recover_text(stdout, stderr, p["prompt"], self.tokenizer)
             is_rep, max_run = check_repetition(token_ids)
             expect_ok = check_expected(text, p.get("expect"))
-            # Verdict: pass if text is non-empty, no severe repetition, and (if factual) expected found
+            # Verdict: a completed engine, non-empty text, no severe repetition,
+            # and (if factual) the expected answer are all required.
             has_text = bool(text.strip())
-            ok = has_text and not is_rep
+            ok = rc == 0 and has_text and not is_rep
             if p.get("expect") and expect_ok is False: ok = False
             if ok: pass_count += 1
             # Diagnose failure mode for reporting
-            if not has_text:
+            if rc != 0:
+                fail_reason = ("engine timed out" if rc == -1 and "[TIMEOUT after " in stderr
+                               else f"engine returned rc={rc}")
+            elif not has_text:
                 fail_reason = "no tokens generated (immediate EOS)"
             elif is_rep:
                 fail_reason = f"repetition loop (max run={max_run})"
