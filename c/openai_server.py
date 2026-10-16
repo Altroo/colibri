@@ -1305,8 +1305,12 @@ def decode_wav_mono16k(data, param):
     pos, fmt, raw = 12, None, None
     while pos + 8 <= len(data):
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
+        if pos + 8 + size > len(data):
+            raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
+            if len(body) < 16:
+                raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
@@ -1314,20 +1318,25 @@ def decode_wav_mono16k(data, param):
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
     audio_format, channels, rate, _, _, bits = fmt
+    if channels == 0:
+        raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
     if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
         audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
     if audio_format == 1 and bits == 16:
+        if len(raw) % (channels * 2):
+            raise APIError(400, "WAV data must contain complete PCM16 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     elif audio_format == 3 and bits == 32:
+        if len(raw) % (channels * 4):
+            raise APIError(400, "WAV data must contain complete float32 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
     if channels > 1:
-        samples = samples[:len(samples) - len(samples) % channels]
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
 
