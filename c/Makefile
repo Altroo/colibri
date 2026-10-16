@@ -2955,6 +2955,10 @@ tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c $(VK_OBJ)
 .PHONY: e8x4g64-loader-check
 e8x4g64-loader-check: tests/test_e8x4g64_loader$(EXE)
 
+# CPU-only synthetic merged-int4 loader data contract (no model or GPU).
+tests/test_qwen36_loader$(EXE): tests/test_qwen36_loader.c qwen36.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
