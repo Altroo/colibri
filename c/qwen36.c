@@ -5371,8 +5371,10 @@ static int serve_read_req(ServeReq *q){
         q->payload=payload; q->plen=(int)bytes; q->slot=dslot;
         return 3;
     }
-    /* 4: the request it names ends (serve_mux; a lone serve reads them mid-turn) */
-    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")){ snprintf(q->id,sizeof(q->id),"%s",id); return 4; }
+    /* 4: cancelled; 5: normal stop (a lone serve reads these mid-turn). */
+    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")){
+        snprintf(q->id,sizeof(q->id),"%s",id); return !strcmp(cmd,"CANCEL") ? 4 : 5;
+    }
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5 ||
@@ -5487,7 +5489,8 @@ static int serve_eos_ids(int *ids, int cap){
  * aspetta l'ack tenendo l'ammissione dello scheduler, quindi un client che si
  * disconnette non liberava niente.
  *
- * Ritorna 1 se e' arrivato un CANCEL/STOP per `id`. Le righe che non
+ * Returns CANCEL or STOP for `id`; STOP must finish with DONE, not an error.
+ * Le righe che non
  * riconosciamo si scartano, com'e' sempre stato: la regola di compatibilita'
  * del protocollo vale in tutte e due le direzioni. Un SUBMIT non puo'
  * legalmente arrivare mentre l'unico slot e' occupato; se arriva viene
@@ -5495,15 +5498,18 @@ static int serve_eos_ids(int *ids, int cap){
  *
  * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai. */
-static int serve_cancel_pending(const char *id){
-    int cancelled = 0;
+enum { Q36_CONTROL_NONE, Q36_CONTROL_STOP, Q36_CONTROL_CANCEL };
+static int serve_control_pending(const char *id){
+    int control = Q36_CONTROL_NONE;
     while(coli_serve_stdin_ready()){
         char line[512], cmd[16], who[64];
         if(!fgets(line,sizeof(line),stdin)) break;
         if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
-        if((!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) && !strcmp(who,id)) cancelled = 1;
+        if(strcmp(who,id)) continue;
+        if(!strcmp(cmd,"CANCEL")) control = Q36_CONTROL_CANCEL;
+        else if(!strcmp(cmd,"STOP") && control == Q36_CONTROL_NONE) control = Q36_CONTROL_STOP;
     }
-    return cancelled;
+    return control;
 }
 
 /* --- Dashboard: Brain e Profile ------------------------------------------
@@ -5697,7 +5703,9 @@ static void serve_one(Model *m, ServeReq *q){
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
          * turno che nessuno vuole piu'. */
-        if(serve_cancel_pending(q->id)){
+        int control = serve_control_pending(q->id);
+        if(control == Q36_CONTROL_STOP){ limited=0; break; }
+        if(control == Q36_CONTROL_CANCEL){
             free(lo); lo=NULL;
             q36_spec_end(m, &spec); q36_spec_free(&spec);   /* the state of the tokens fed, drafts undone */
             if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
@@ -6074,15 +6082,15 @@ static int q36_clef_test_modes(Model *m){
  * step picks the next token of each active request and runs one forward over a row
  * of each (q36_step_rows): the matrices and the experts are read once for all of
  * them. A request's frames are a lone request's; they interleave by id. Nothing
- * drafts (speculation follows one conversation). STOP and CANCEL end a request as
- * serve_one ends it, with ERROR CANCELLED. A Clef DECIDE runs at once on its slot. */
+ * drafts (speculation follows one conversation). STOP finishes with DONE; CANCEL
+ * ends with ERROR CANCELLED, as in serve_one. A Clef DECIDE runs at once on its slot. */
 static int g_q36_mux_slots = 1;
 static Q36Seq *g_q36_mux_seq;   /* [slots]: the conversations the Model does not hold */
 static int g_q36_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
 
 typedef struct {
     ServeReq q;
-    int active, cancel, limited, forwards;
+    int active, cancel, stop, limited, forwards;
     int *ids, np, gen;
     float *lo;                  /* the logits the next pick reads */
     Q36ReqClock clk;
@@ -6132,7 +6140,8 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
 /* The next token of an active request, as serve_one's loop picks and sends it: 1
  * with the token when the request goes on, 0 when it ended. */
 static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
-    if (r->cancel || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    if (r->stop) r->limited = 0;
+    if (r->cancel || r->stop || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
     int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
     char lptail[1024]; lptail[0] = 0;
     if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
@@ -6166,8 +6175,11 @@ static void serve_mux(Model *m){
             ServeReq q = {0};
             int r = serve_read_req(&q);
             if (r < 0) input_eof = 1;
-            else if (r == 4) {
-                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, q.id)) rq[i].cancel = 1;
+            else if (r == 4 || r == 5) {
+                for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, q.id)) {
+                    if (r == 4) rq[i].cancel = 1;
+                    else rq[i].stop = 1;
+                }
             } else if (r == 2 || r == 3) {
                 int bad = q.slot < 0 || q.slot >= n;
                 if (bad || rq[q.slot].active) {
@@ -6244,7 +6256,7 @@ static void serve_loop(Model *m){
     if(g_q36_mux_slots>1){ serve_mux(m); return; }
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q); while(r==0||r==4);
+        do r=serve_read_req(&q); while(r==0||r==4||r==5);
         if(r<0) return;
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
