@@ -60,7 +60,7 @@ void coli_st_index_close(ColiSafetensorsIndex *index) {
     st_mirror_reset(index);
     for (int i = 0; i < index->n; i++) free(index->t[i].name);
     for (int i = 0; i < index->nfd; i++) {
-        if (index->fds[i] >= 0) close(index->fds[i]);
+        if (index->fds[i] >= 0) { st_shard_pair(index->fds[i], -1); close(index->fds[i]); }
         if (index->dfds[i] >= 0) close(index->dfds[i]);
         free(index->paths[i]);
     }
@@ -3344,10 +3344,15 @@ int coli_v4_attention_window_batch_ref(
         gpu_wo_done = 1;
     }
 #endif
+    int wo_a_done = gpu_wo_done;
+    if (!result && !wo_a_done && batch == 1 &&
+        wo_a.rows == (int64_t)groups * o_rank && wo_a.columns == group_width &&
+        coli_fp8_grouped_matvec_ref(oa, &wo_a, attended, groups) == 0)
+        wo_a_done = 1;
     float *group_inputs = v4_attn_scratch(11, (size_t)batch * group_width * sizeof(*group_inputs), 0);
     float *group_outputs = v4_attn_scratch(12, (size_t)batch * o_rank * sizeof(*group_outputs), 0);
-    if (!gpu_wo_done && (!group_inputs || !group_outputs)) result = -1;
-    for (int group = 0; !result && !gpu_wo_done && group < groups; group++) {
+    if (!wo_a_done && (!group_inputs || !group_outputs)) result = -1;
+    for (int group = 0; !result && !wo_a_done && group < groups; group++) {
         for (int item = 0; item < batch; item++)
             memcpy(group_inputs + (size_t)item * group_width,
                    attended + (size_t)item * q_width + (size_t)group * group_width,
@@ -4470,9 +4475,14 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
     if (!output || !queries || !kv || !sinks || !indices || heads < 1 ||
         head_dimension < 1 || kv_count < 1 || topk < 1 || !(softmax_scale > 0.0f))
         return -1;
-    float *scores = malloc((size_t)topk * sizeof(*scores));
-    if (!scores) return -1;
+    for (int rank = 0; rank < topk; rank++)
+        if (indices[rank] >= kv_count) return -1;
+    float *all_scores = malloc((size_t)heads * topk * sizeof(*all_scores));
+    if (!all_scores) return -1;
+    int failed = 0;
+    #pragma omp parallel for schedule(static) reduction(|:failed) if(heads > 1)
     for (int head = 0; head < heads; head++) {
+        float *scores = all_scores + (size_t)head * topk;
         const float *query = queries + (size_t)head * head_dimension;
         float maximum = -INFINITY;
         for (int rank = 0; rank < topk; rank++) {
@@ -4480,10 +4490,6 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             if (index < 0) {
                 scores[rank] = -INFINITY;
                 continue;
-            }
-            if (index >= kv_count) {
-                free(scores);
-                return -1;
             }
             const float *key = kv + (size_t)index * head_dimension;
             float score = 0.0f;
@@ -4494,8 +4500,8 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             if (score > maximum) maximum = score;
         }
         if (!isfinite(maximum)) {
-            free(scores);
-            return -1;
+            failed = 1;
+            continue;
         }
         float denominator = expf(sinks[head] - maximum);
         float *head_output = output + (size_t)head * head_dimension;
@@ -4513,8 +4519,8 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
         for (int column = 0; column < head_dimension; column++)
             head_output[column] = coli_bf16_round(head_output[column] / denominator);
     }
-    free(scores);
-    return 0;
+    free(all_scores);
+    return failed ? -1 : 0;
 }
 #endif /* COLI_V4_UNIT_SPARSE_ATTENTION */
 
@@ -10471,7 +10477,11 @@ static int route_bf16_impl(float *weights, int *indices, const float *hidden,
     int on_device = !logits && coli_v4_vk_matmul &&
                     coli_v4_vk_matmul(11, gate, NULL, 0, experts, dimension,
                                       scores, hidden, 1) == 0;
+    int cpu_logits = !logits && !on_device;
+#else
+    int cpu_logits = !logits;
 #endif
+    #pragma omp parallel for schedule(static) if(cpu_logits && experts >= 32 && dimension >= 128)
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
         const uint16_t *row = gate + (size_t)expert * dimension;
@@ -18696,7 +18706,36 @@ int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
         uint8_t encoded_scale = (uint8_t)(scale_exponent + 127);
         float scale = coli_e8m0_decode(encoded_scale);
         scales[base / block_size] = encoded_scale;
-        for (size_t i = 0; i < count; i++) {
+        size_t i = 0;
+#ifdef __AVX2__
+        /* E4M3 round-to-nearest-even on the f32 bits: normals keep 3 mantissa
+         * bits, subnormals (below 2^-6) are multiples of 2^-9. Bit-identical
+         * to the scalar encode/decode below, NaN clamping included. */
+        __m256 scale8 = _mm256_set1_ps(scale);
+        for (; i + 8 <= count; i += 8) {
+            __m256 normalized = _mm256_max_ps(_mm256_set1_ps(-448.0f),
+                _mm256_min_ps(_mm256_div_ps(_mm256_loadu_ps(input + base + i), scale8),
+                              _mm256_set1_ps(448.0f)));
+            __m256i bits = _mm256_castps_si256(normalized);
+            __m256i sign = _mm256_and_si256(bits, _mm256_set1_epi32((int)0x80000000u));
+            __m256i magnitude = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff));
+            __m256i rounded = _mm256_add_epi32(magnitude, _mm256_add_epi32(
+                _mm256_set1_epi32(0x7ffff),
+                _mm256_and_si256(_mm256_srli_epi32(magnitude, 20), _mm256_set1_epi32(1))));
+            __m256 normal = _mm256_castsi256_ps(_mm256_and_si256(rounded,
+                _mm256_set1_epi32((int)0xfff00000u)));
+            __m256 absolute = _mm256_castsi256_ps(magnitude);
+            __m256 subnormal = _mm256_mul_ps(_mm256_round_ps(
+                _mm256_mul_ps(absolute, _mm256_set1_ps(512.0f)),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), _mm256_set1_ps(1.0f / 512.0f));
+            __m256 quantized = _mm256_blendv_ps(normal, subnormal,
+                _mm256_cmp_ps(absolute, _mm256_set1_ps(0.015625f), _CMP_LT_OQ));
+            quantized = _mm256_castsi256_ps(_mm256_or_si256(
+                _mm256_castps_si256(quantized), sign));
+            _mm256_storeu_ps(output + base + i, _mm256_mul_ps(quantized, scale8));
+        }
+#endif
+        for (; i < count; i++) {
             float normalized = fmaxf(-448.0f,
                                      fminf(448.0f, input[base + i] / scale));
             output[base + i] = coli_e4m3fn_decode(
@@ -19303,32 +19342,6 @@ static int fp8_matvec_validate(const ColiTensorView *weight) {
 
 /* Compute CPU su attivazione GIA' qdq (estratto invariato da matvec_ref).
  * EN: CPU compute on an already-qdq'd activation, extracted verbatim. */
-#ifdef __AVX2__
-/* Branchless SIMD decode of 8 E4M3FN codes -> 8 f32, byte-identical to
- * coli_e4m3fn_decode for all 256 inputs (exhaustively verified). Replaces a
- * slow per-element _mm256_i32gather_ps from a 256-float LUT. E4M3FN values are
- * exact, so the f32 bit pattern is built directly: normals via integer field
- * assembly, subnormals as (float)mantissa*2^-9 (exact), NaN (code&0x7F==0x7F)
- * as canonical qNaN overwriting the sign. */
-static inline __m256 v4_fp8_decode8(__m256i codes) {
-    __m256i man = _mm256_and_si256(codes, _mm256_set1_epi32(7));
-    __m256i exp = _mm256_and_si256(_mm256_srli_epi32(codes, 3), _mm256_set1_epi32(0xF));
-    __m256i sgn = _mm256_slli_epi32(_mm256_srli_epi32(codes, 7), 31);
-    __m256i nbits = _mm256_or_si256(
-        _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
-        _mm256_slli_epi32(man, 20));
-    __m256 nval = _mm256_castsi256_ps(nbits);
-    float man_factor = 1.0f / (float)(1 << 9);
-    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
-    __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
-    __m256i sbits = _mm256_or_si256(
-        _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
-    __m256i is_nan = _mm256_cmpeq_epi32(
-        _mm256_and_si256(codes, _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x7F));
-    return _mm256_castsi256_ps(
-        _mm256_blendv_epi8(sbits, _mm256_set1_epi32(0x7FC00000), is_nan));
-}
-#endif
 
 static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                               const float *activation) {
@@ -19343,6 +19356,31 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
         }
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
+#ifdef __AVX512F__
+        if (rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+                __m512 sum = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low = data + (size_t)tile * columns * 16;
+                const uint8_t *high = low + columns * 8;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m512 scale = _mm512_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                        __m512 values = v4_fp8_decode16_bytes(bytes);
+                        sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_mul_ps(
+                            _mm512_set1_ps(activation[column]), values), scale));
+                    }
+                }
+                _mm512_storeu_ps(output + (size_t)tile * 16, sum);
+            }
+            return 0;
+        }
+#endif
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
             __m256 sum = _mm256_setzero_ps();
@@ -19354,8 +19392,7 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                     size_t column = base + offset;
                     __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
                         ((size_t)tile * columns + column) * 8));
-                    __m256i codes = _mm256_cvtepu8_epi32(bytes);
-                    __m256 values = v4_fp8_decode8(codes);
+                    __m256 values = v4_fp8_decode8_bytes(bytes);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum = _mm256_add_ps(sum, _mm256_mul_ps(
                         _mm256_mul_ps(x, values), scale));
@@ -19550,11 +19587,40 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         if (rows % 8) {
             return -1;
         }
-        float fp8[256];
-        for (int code = 0; code < 256; code++)
-            fp8[code] = coli_e4m3fn_decode((uint8_t)code);
         const uint8_t *data_a = a->data, *data_b = b->data;
         const float *scales_a = a->scales, *scales_b = b->scales;
+#ifdef __AVX512F__
+        if (rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < a->rows / 16; tile++) {
+                __m512 sum_a = _mm512_setzero_ps(), sum_b = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low_a = data_a + (size_t)tile * columns * 16;
+                const uint8_t *low_b = data_b + (size_t)tile * columns * 16;
+                for (size_t base = 0; base < columns; base += 128) {
+                    size_t scale_index = scale_row * scale_columns + base / 128;
+                    __m512 scale_a = _mm512_set1_ps(scales_a[scale_index]);
+                    __m512 scale_b = _mm512_set1_ps(scales_b[scale_index]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes_a = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low_a + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(low_a + (columns + column) * 8)));
+                        __m128i bytes_b = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low_b + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(low_b + (columns + column) * 8)));
+                        __m512 x = _mm512_set1_ps(activation[column]);
+                        sum_a = _mm512_add_ps(sum_a, _mm512_mul_ps(_mm512_mul_ps(x,
+                            v4_fp8_decode16_bytes(bytes_a)), scale_a));
+                        sum_b = _mm512_add_ps(sum_b, _mm512_mul_ps(_mm512_mul_ps(x,
+                            v4_fp8_decode16_bytes(bytes_b)), scale_b));
+                    }
+                }
+                _mm512_storeu_ps(output_a + (size_t)tile * 16, sum_a);
+                _mm512_storeu_ps(output_b + (size_t)tile * 16, sum_b);
+            }
+            return 0;
+        }
+#endif
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < a->rows / 8; tile++) {
             __m256 sum_a = _mm256_setzero_ps();
@@ -19567,12 +19633,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                 for (size_t offset = 0; offset < 128; offset++) {
                     size_t column = base + offset;
                     size_t packed = ((size_t)tile * columns + column) * 8;
-                    __m256i codes_a = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    __m256 values_a = v4_fp8_decode8_bytes(_mm_loadl_epi64(
                         (const __m128i *)(data_a + packed)));
-                    __m256i codes_b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    __m256 values_b = v4_fp8_decode8_bytes(_mm_loadl_epi64(
                         (const __m128i *)(data_b + packed)));
-                    __m256 values_a = _mm256_i32gather_ps(fp8, codes_a, 4);
-                    __m256 values_b = _mm256_i32gather_ps(fp8, codes_b, 4);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum_a = _mm256_add_ps(sum_a, _mm256_mul_ps(
                         _mm256_mul_ps(x, values_a), scale_a));
@@ -19707,11 +19771,58 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
         if (rows % 8) {
             return -1;
         }
-        float fp8[256];
-        for (int code = 0; code < 256; code++)
-            fp8[code] = coli_e4m3fn_decode((uint8_t)code);
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
+#ifdef __AVX512F__
+        if (batch == 1 && rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+                __m512 sum = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low = data + (size_t)tile * columns * 16;
+                const uint8_t *high = low + columns * 8;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m512 scale = _mm512_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                        __m512 values = _mm512_mul_ps(
+                            v4_fp8_decode16_bytes(bytes), scale);
+                        sum = _mm512_add_ps(sum, _mm512_mul_ps(
+                            _mm512_set1_ps(activations[column]), values));
+                    }
+                }
+                _mm512_storeu_ps(outputs + (size_t)tile * 16, sum);
+            }
+            return 0;
+        }
+#endif
+        /* Keep the decode accumulator in a register instead of indexing the
+         * runtime batch array in the OpenMP worker. Same arithmetic per row. */
+        if (batch == 1) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
+                __m256 sum = _mm256_setzero_ps();
+                size_t scale_row = ((size_t)tile * 8) / 128;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m256 scale = _mm256_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t offset = 0; offset < 128; offset++) {
+                        size_t column = base + offset;
+                        __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
+                            ((size_t)tile * columns + column) * 8));
+                        __m256 values = _mm256_mul_ps(
+                            v4_fp8_decode8_bytes(bytes), scale);
+                        sum = _mm256_add_ps(sum, _mm256_mul_ps(
+                            _mm256_set1_ps(activations[column]), values));
+                    }
+                }
+                _mm256_storeu_ps(outputs + (size_t)tile * 8, sum);
+            }
+            return 0;
+        }
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
             __m256 sums[128];
@@ -19725,9 +19836,8 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
                     size_t column = base + offset;
                     __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
                         ((size_t)tile * columns + column) * 8));
-                    __m256i codes = _mm256_cvtepu8_epi32(bytes);
                     __m256 values = _mm256_mul_ps(
-                        _mm256_i32gather_ps(fp8, codes, 4), scale);
+                        v4_fp8_decode8_bytes(bytes), scale);
                     for (int item = 0; item < batch; item++) {
                         __m256 x = _mm256_set1_ps(
                             activations[(size_t)item * columns + column]);
@@ -19746,6 +19856,52 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
     matmul_fp8(outputs, activations, weight->data, weight->scales,
                batch, (int)columns, (int)rows);
     return 0;
+}
+
+/* Grouped wo_a has independent input slices. One team spans every group,
+ * avoiding a separate small OpenMP launch for each output projection. Same
+ * per-row arithmetic as fp8_batch_compute's batch-one path. */
+int coli_fp8_grouped_matvec_ref(float *outputs, const ColiTensorView *weight,
+                                const float *inputs, int groups) {
+#ifndef __AVX512F__
+    (void)outputs; (void)weight; (void)inputs; (void)groups;
+    return -1;
+#else
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_matmul) return -1;   /* the per-group path tries the device */
+#endif
+    if (!outputs || !inputs || groups < 1 || fp8_batch_validate(weight, 1) ||
+        weight->block_rows != 8 || weight->rows % groups ||
+        (weight->rows / groups) % 128) return -1;
+    size_t columns = (size_t)weight->columns, group_rows = (size_t)weight->rows / groups;
+    size_t scale_columns = columns / 128;
+    float *activations; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch((size_t)groups * columns, (size_t)groups * scale_columns,
+                            &activations, &activation_scales) ||
+        coli_fp8_activation_qdq_ref(activations, activation_scales, inputs,
+                                     (size_t)groups * columns, 128)) return -1;
+    const uint8_t *data = weight->data;
+    const float *scales = weight->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+        size_t row = (size_t)tile * 16;
+        const float *input = activations + (row / group_rows) * columns;
+        const uint8_t *low = data + row * columns, *high = low + columns * 8;
+        __m512 sum = _mm512_setzero_ps();
+        for (size_t base = 0; base < columns; base += 128) {
+            __m512 scale = _mm512_set1_ps(scales[(row / 128) * scale_columns + base / 128]);
+            for (size_t column = base; column < base + 128; column++) {
+                __m128i bytes = _mm_unpacklo_epi64(
+                    _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                    _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                __m512 values = _mm512_mul_ps(v4_fp8_decode16_bytes(bytes), scale);
+                sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_set1_ps(input[column]), values));
+            }
+        }
+        _mm512_storeu_ps(outputs + row, sum);
+    }
+    return 0;
+#endif
 }
 
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
